@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+psycopg[binary]
+asyncpg
+scikit-learn
+scikit-uplift
+numpy
+pandas
+pytest
+pytest-asyncio
+httpx
+faker
