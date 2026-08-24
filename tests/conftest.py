@@ -61,22 +61,43 @@ async def conn(db_pool):
             await transaction.rollback()
 
 
+TRUNCATE_ALL = """
+    TRUNCATE attempts, contacts, audit_log, at_risk_records,
+             subscriptions, customers, webhook_events
+    RESTART IDENTITY CASCADE
+"""
+
+
 @pytest_asyncio.fixture
 async def clean_db(db_pool):
-    """Truncate everything. For tests that need real commits, not a rollback."""
+    """Truncate everything. For tests that need real commits, not a rollback.
+
+    Truncates on the way out as well: these tests commit, and committed rows
+    would otherwise be visible to every later test that counts rows.
+    """
     async with db_pool.acquire() as connection:
-        await connection.execute(
-            """
-            TRUNCATE attempts, contacts, audit_log, at_risk_records,
-                     subscriptions, customers, webhook_events
-            RESTART IDENTITY CASCADE
-            """
-        )
-    yield db_pool
+        await connection.execute(TRUNCATE_ALL)
+    try:
+        yield db_pool
+    finally:
+        async with db_pool.acquire() as connection:
+            await connection.execute(TRUNCATE_ALL)
 
 
-async def insert_record(conn, *, status: str = "open", suffix: str = "1") -> int:
-    """Insert a customer, subscription and at-risk record. Returns record id."""
+async def insert_scenario(
+    conn,
+    *,
+    status: str = "open",
+    mandate_status: str = "active",
+    suffix: str | None = None,
+) -> dict[str, int]:
+    """Insert a customer, subscription and at-risk record.
+
+    Returns all three ids, because the guard reads across all three tables.
+    """
+    if suffix is None:
+        suffix = uuid.uuid4().hex[:10]
+
     customer_id = await conn.fetchval(
         "INSERT INTO customers (external_id) VALUES ($1) RETURNING id",
         f"cust_test_{suffix}",
@@ -86,13 +107,14 @@ async def insert_record(conn, *, status: str = "open", suffix: str = "1") -> int
         INSERT INTO subscriptions
             (customer_id, external_id, plan_amount, billing_cycle_days,
              mandate_status)
-        VALUES ($1, $2, 49900, 30, 'active')
+        VALUES ($1, $2, 49900, 30, $3::mandate_status)
         RETURNING id
         """,
         customer_id,
         f"sub_test_{suffix}",
+        mandate_status,
     )
-    return await conn.fetchval(
+    record_id = await conn.fetchval(
         """
         INSERT INTO at_risk_records
             (subscription_id, customer_id, invoice_id, amount, failure_code,
@@ -106,4 +128,65 @@ async def insert_record(conn, *, status: str = "open", suffix: str = "1") -> int
         f"inv_test_{suffix}",
         status,
         "seeded_for_test" if status == "skipped" else None,
+    )
+    return {
+        "customer_id": customer_id,
+        "subscription_id": subscription_id,
+        "record_id": record_id,
+    }
+
+
+async def insert_record(conn, *, status: str = "open", suffix: str = "1") -> int:
+    """Insert a customer, subscription and at-risk record. Returns record id."""
+    scenario = await insert_scenario(conn, status=status, suffix=suffix)
+    return scenario["record_id"]
+
+
+async def insert_attempt(
+    conn,
+    record_id: int,
+    attempt_number: int,
+    *,
+    outcome: str = "failure",
+    scheduled_at=None,
+    executed_at=None,
+) -> int:
+    """Insert one attempt row. executed_at is required unless outcome=pending."""
+    return await conn.fetchval(
+        """
+        INSERT INTO attempts
+            (at_risk_record_id, attempt_number, scheduled_at, executed_at,
+             outcome)
+        VALUES ($1, $2, $3, $4, $5::attempt_outcome)
+        RETURNING id
+        """,
+        record_id,
+        attempt_number,
+        scheduled_at or executed_at,
+        executed_at,
+        outcome,
+    )
+
+
+async def insert_notification(
+    conn,
+    customer_id: int,
+    subscription_id: int | None,
+    sent_at,
+    *,
+    purpose: str = "pre_debit_notification",
+    channel: str = "sms",
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO contacts
+            (customer_id, subscription_id, channel, purpose, sent_at)
+        VALUES ($1, $2, $3::contact_channel, $4::contact_purpose, $5)
+        RETURNING id
+        """,
+        customer_id,
+        subscription_id,
+        channel,
+        purpose,
+        sent_at,
     )

@@ -24,12 +24,27 @@ from forbear.models.models import (
 ENTITY_TYPE = "at_risk_record"
 
 # status -> statuses reachable from it. Terminal statuses map to an empty set.
+#
+# open -> recovered and scheduled -> recovered exist for one reason: the
+# customer can pay out of band at any moment, and a payment.captured webhook
+# then arrives for a record Forbear has not acted on yet. Without those edges
+# that real event is unrepresentable, and ingestion would have to either drop
+# the recovery or fake a scheduled/in_flight history that never happened.
 ALLOWED_TRANSITIONS: dict[RecordStatus, frozenset[RecordStatus]] = {
     RecordStatus.OPEN: frozenset(
-        {RecordStatus.SCHEDULED, RecordStatus.SKIPPED, RecordStatus.ABANDONED}
+        {
+            RecordStatus.SCHEDULED,
+            RecordStatus.SKIPPED,
+            RecordStatus.ABANDONED,
+            RecordStatus.RECOVERED,
+        }
     ),
     RecordStatus.SCHEDULED: frozenset(
-        {RecordStatus.IN_FLIGHT, RecordStatus.ABANDONED}
+        {
+            RecordStatus.IN_FLIGHT,
+            RecordStatus.ABANDONED,
+            RecordStatus.RECOVERED,
+        }
     ),
     RecordStatus.IN_FLIGHT: frozenset(
         {

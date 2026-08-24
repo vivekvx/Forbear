@@ -48,6 +48,16 @@ class ContactChannel(str, Enum):
     EMAIL = "email"
 
 
+class ContactPurpose(str, Enum):
+    PRE_DEBIT_NOTIFICATION = "pre_debit_notification"
+    DUNNING = "dunning"
+
+
+class ActionKind(str, Enum):
+    CHARGE = "charge"
+    CONTACT = "contact"
+
+
 @dataclass
 class Customer:
     id: int
@@ -74,7 +84,9 @@ class AtRiskRecord:
     invoice_id: str  # Razorpay invoice_id
     amount: int  # paise
     failure_code: str
-    failure_class: FailureClass
+    # None means the classifier had no mapping: on the exception list, not
+    # defaulted to a class. Never treat None as recoverable.
+    failure_class: Optional[FailureClass]
     status: RecordStatus
     created_at: datetime
     updated_at: datetime
@@ -100,8 +112,25 @@ class Contact:
     id: int
     customer_id: int
     channel: ContactChannel
+    purpose: ContactPurpose
     sent_at: datetime
     created_at: datetime
+    # Null for a customer-level contact that targets no single subscription.
+    subscription_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ProposedAction:
+    """What the allocator wants to do next, handed to the guard for permission.
+
+    This is a proposal, not state. The guard treats every field here as a claim
+    to be checked against the database, never as a fact.
+    """
+
+    kind: ActionKind
+    at_risk_record_id: int
+    attempt_number: int
+    channel: Optional[ContactChannel] = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +163,11 @@ def at_risk_record_from_row(row) -> AtRiskRecord:
         invoice_id=row["invoice_id"],
         amount=row["amount"],
         failure_code=row["failure_code"],
-        failure_class=FailureClass(row["failure_class"]),
+        failure_class=(
+            FailureClass(row["failure_class"])
+            if row["failure_class"] is not None
+            else None
+        ),
         status=RecordStatus(row["status"]),
         uplift_score=row["uplift_score"],
         whittle_index=row["whittle_index"],

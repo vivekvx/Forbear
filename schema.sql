@@ -32,6 +32,11 @@ CREATE TYPE attempt_outcome AS ENUM (
 
 CREATE TYPE contact_channel AS ENUM ('payment_link', 'sms', 'email');
 
+-- A pre-debit notification is a regulatory precondition for a debit, not a
+-- dunning message. The guard has to tell them apart, so the distinction is
+-- stored rather than inferred from the channel.
+CREATE TYPE contact_purpose AS ENUM ('pre_debit_notification', 'dunning');
+
 
 CREATE TABLE customers (
     id          BIGSERIAL PRIMARY KEY,
@@ -60,7 +65,10 @@ CREATE TABLE at_risk_records (
     invoice_id      TEXT        NOT NULL UNIQUE,  -- Razorpay invoice_id
     amount          BIGINT      NOT NULL CHECK (amount > 0),  -- paise
     failure_code    TEXT        NOT NULL,
-    failure_class   failure_class NOT NULL,
+    -- NULL means the classifier had no mapping for failure_code: the record is
+    -- on the exception list awaiting a human, not silently defaulted to a
+    -- class. Nothing downstream may treat NULL as a recoverable class.
+    failure_class   failure_class,
     status          record_status NOT NULL DEFAULT 'open',
     uplift_score    DOUBLE PRECISION,
     whittle_index   DOUBLE PRECISION,
@@ -104,16 +112,28 @@ CREATE TABLE attempts (
 CREATE INDEX attempts_record_idx ON attempts (at_risk_record_id);
 
 
--- Per-customer contact budget is enforced by counting rows here.
+-- Per-customer contact budget is enforced by counting rows here. The guard
+-- also reads this table to confirm a pre-debit notification exists for the
+-- subscription about to be debited.
 CREATE TABLE contacts (
-    id          BIGSERIAL PRIMARY KEY,
-    customer_id BIGINT      NOT NULL REFERENCES customers (id),
-    channel     contact_channel NOT NULL,
-    sent_at     TIMESTAMPTZ NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              BIGSERIAL PRIMARY KEY,
+    customer_id     BIGINT      NOT NULL REFERENCES customers (id),
+    -- Nullable: a customer-level contact need not target one subscription.
+    subscription_id BIGINT      REFERENCES subscriptions (id),
+    channel         contact_channel NOT NULL,
+    purpose         contact_purpose NOT NULL,
+    sent_at         TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- A pre-debit notification authorises a debit on one specific mandate.
+    -- Without a subscription it authorises nothing.
+    CONSTRAINT notification_targets_a_subscription
+        CHECK (purpose <> 'pre_debit_notification' OR subscription_id IS NOT NULL)
 );
 
 CREATE INDEX contacts_customer_sent_idx ON contacts (customer_id, sent_at);
+CREATE INDEX contacts_notification_idx
+    ON contacts (subscription_id, purpose, sent_at);
 
 
 -- Hash-linked audit chain. Entries are linked per entity: hash covers
