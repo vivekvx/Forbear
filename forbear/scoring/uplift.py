@@ -121,6 +121,28 @@ class NotFittedError(Exception):
     """Scoring was attempted before fit(). Never a default-shaped answer."""
 
 
+@dataclass(frozen=True)
+class UpliftEvaluation:
+    """Both Qini scores, because only one of them means anything.
+
+    held_out_qini is the number to publish. in_sample_qini is carried beside it
+    so the gap stays visible: quoting the in-sample figure alone is how a model
+    ends up described as four times better than it is.
+    """
+
+    in_sample_qini: float
+    held_out_qini: float
+    n_train: int
+    n_test: int
+
+    @property
+    def overstatement(self) -> float:
+        """How many times larger the in-sample score is. 1.0 means no gap."""
+        if self.held_out_qini == 0:
+            return float("inf")
+        return self.in_sample_qini / self.held_out_qini
+
+
 class UpliftModel:
     """T-Learner over two gradient-boosted classifiers.
 
@@ -205,6 +227,72 @@ class UpliftModel:
         treated = self._treated_model.predict_proba(X)[:, 1]
         control = self._control_model.predict_proba(X)[:, 1]
         return treated - control
+
+    def fit_and_evaluate(
+        self,
+        X: np.ndarray,
+        treatment: np.ndarray,
+        outcome: np.ndarray,
+        test_size: float = 0.3,
+    ) -> "UpliftEvaluation":
+        """Fit, and report how well the ranking survives unseen records.
+
+        Scoring a model on the rows it was fitted on measures memorisation, not
+        discrimination, and gradient boosting is good at memorisation. On this
+        generator the in-sample Qini runs about four times the held-out figure,
+        so the gap is not a rounding detail - it is most of the number.
+
+        The split is stratified on the treatment/outcome pair rather than on
+        treatment alone. Treatment alone can hand the training half an arm
+        whose outcomes are all identical, which fit() refuses outright; the
+        pair keeps both arms and both classes proportional in both halves.
+
+        The model is left fitted on ALL the data, not just the training half.
+        The held-out score estimates how a model built this way generalises;
+        the model worth scoring with is the one that has seen everything.
+        Reporting the first while shipping the second is the standard
+        arrangement, and saying so here is cheaper than the argument later.
+        """
+        from sklearn.model_selection import train_test_split
+
+        # Local import: forbear.scoring.evaluation pulls in matplotlib, and the
+        # allocator imports this module on the decision path.
+        from forbear.scoring.evaluation import qini_score
+
+        X = np.asarray(X, dtype=float)
+        treatment = np.asarray(treatment).astype(bool)
+        outcome = np.asarray(outcome).astype(int)
+
+        strata = treatment.astype(int) * 2 + outcome
+        indices = np.arange(len(X))
+        train_index, test_index = train_test_split(
+            indices,
+            test_size=test_size,
+            random_state=self.seed,
+            stratify=strata,
+        )
+
+        self.fit(X[train_index], treatment[train_index], outcome[train_index])
+
+        in_sample = qini_score(
+            self.predict_cate(X[train_index]),
+            treatment[train_index],
+            outcome[train_index],
+        )
+        held_out = qini_score(
+            self.predict_cate(X[test_index]),
+            treatment[test_index],
+            outcome[test_index],
+        )
+
+        self.fit(X, treatment, outcome)
+
+        return UpliftEvaluation(
+            in_sample_qini=in_sample,
+            held_out_qini=held_out,
+            n_train=len(train_index),
+            n_test=len(test_index),
+        )
 
     def predict_recovery_probability(self, X: np.ndarray) -> np.ndarray:
         """Absolute probability of the favourable outcome under contact.

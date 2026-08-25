@@ -163,7 +163,17 @@ measurement design.
 
 **Before/after.** Before: failure at 22m16s with an opaque out-of-memory
 error. After: skip in ~2s naming the exact record ceiling (1,706 records on
-this machine's configuration) and what raises it.
+the default configuration) and what raises it.
+
+**Resolved, 2026-08-25.** `max_locks_per_transaction` raised to **600**. The
+full n=10,000 comparison now completes in **137 seconds** — the earlier
+84-minute figure was the nested-loop query above, not this. Two consequences
+worth recording: the three scale assertions stopped skipping and started
+genuinely failing, which is how the net-negative result became a hard test
+result rather than a note; and adding the fourth and fifth strategies raised
+the lock requirement to 5 × n, so the computed ceiling (9,600 on this box)
+now sits just under n=10,000 and the scale tests skip again. Committing per
+chunk would end the dependency on server configuration for good.
 
 ---
 
@@ -224,6 +234,127 @@ regardless of this target fix.
 
 ---
 
+### 2026-08-25 — The guard's notification rule was inverted
+
+**Symptom.** An audit probe asked the guard to permit a debit at a range of
+notice periods. It permitted one sent **10 seconds** earlier and refused the
+one sent 25 hours earlier — the only compliant case in the set.
+
+**Assumed.** The rule enforced NPCI's pre-debit notification requirement,
+since it was named for it, had a dedicated constant, and had passing tests.
+
+**Actually wrong.** The bound pointed the wrong way. The rule accepted
+`now - 24h <= sent_at <= now`, which reads "sent within the last 24 hours."
+NPCI requires the customer to be warned *before* the debit, with at least a
+day to act — the notification must have **aged past** 24 hours, not stayed
+under it. Both existing tests (`older_than_24h`, `exactly_24h_old`) probed
+only the expiry end, so the entire lead-time requirement was untested and the
+rule enforced approximately its opposite.
+
+Worse, `plant_target` in the adversarial suite defaulted to a **1-hour-old**
+notification, so the "clean, permitted" record that every attack was measured
+against — and that the sixth test used to prove the guard was not simply
+refusing everything — was itself illegal to charge.
+
+**Fix.** Replaced `NOTIFICATION_VALIDITY` with two bounds pointing in
+opposite directions: `NOTIFICATION_MIN_LEAD` (24h, compared strictly, since
+"at least 24 hours" is not satisfied by exactly 24 hours) and
+`NOTIFICATION_MAX_AGE` (7 days, so one notification cannot authorise debits
+forever). The allocator's scheduling window inverted to match — an existing
+notification now opens a window that may not have started yet — and the
+harness's notification stub moved from 2 hours' lead to 25.
+
+**Before/after.** Before: debit permitted at 10s, 1h, 23h, and 24h of notice;
+refused at 25h. After: refused at 10s, 1h, 23h, 24h; permitted at 25h;
+refused again at 8 days. Six boundary cases now pinned by parametrised test,
+plus a sixth adversarial attack.
+
+**Uncomfortable side effect, and the point of the exercise.** With the rule
+corrected, the harness's own notification stub became non-compliant and the
+guard blocked **223 of 223** Forbear attempts — every strategy in the family
+scored zero. The harness had never complied; nothing had been able to say so.
+Fixing the stub restored the numbers unchanged.
+
+---
+
+### 2026-08-25 — Every Qini score in the repository was in-sample
+
+**Symptom.** Qini *fell* as data grew: 0.3610 at n=2,000 against 0.2185 at
+n=8,000, averaged over 8 seeds. More data making a model look worse is
+backwards.
+
+**Assumed.** A generator problem, or noise in the smaller sample.
+
+**Actually wrong.** `test_uplift.build_dataset` fitted on `X` and then called
+`predict_cate(X)` — the same rows. Every Qini the project reported measured
+memorisation, not discrimination, and gradient boosting memorises a small
+sample more completely than a large one, which is why the number fell as n
+rose. A grep for `train_test_split`, `holdout`, and `cross_val` across
+`forbear/` and `tests/` returned nothing: no out-of-sample evaluation existed
+anywhere.
+
+**Fix.** `UpliftModel.fit_and_evaluate` — a 70/30 split stratified on the
+treatment/outcome pair (treatment alone can hand the training half an arm
+with one outcome class, which `fit` refuses), fitting on the majority,
+scoring both halves, and returning both numbers so the gap stays visible. The
+test that asserted in-sample Qini was replaced with a held-out one, and a
+second test asserts the in-sample figure exceeds it, so the defect cannot
+return unnoticed.
+
+**Before/after.** Reported 0.3749 (in-sample). Actual held-out **0.0907**,
+against 0.4243 in-sample on the same data — the published figure overstated
+discrimination by **4.7x**. Still above a shuffled control near zero, so the
+signal is real; there is simply about a fifth as much of it as claimed.
+
+---
+
+### 2026-08-25 — The Whittle index had never operated under a binding budget
+
+**Symptom.** Across 12 seeds at n=500, the skip reason
+`batch_budget_exhausted` fired **zero** times. Skips were 55.1%
+`negative_net_value` and 44.9% `terminal_failure_class`, and nothing else.
+
+**Assumed.** The budget was binding in normal operation; the constant was
+there and one test exercised it.
+
+**Actually wrong.** `batch_budget` defaults to `None` in both
+`AllocationConfig` and `HarnessConfig`, and only one test
+(`test_harness.py`, n=120) ever set it. Every reported number — n=500,
+n=10,000, the sensitivity sweep, the demo — ran with no ceiling. A Whittle
+index is the Lagrangian price of an activation constraint; with no
+constraint it decides sign and nothing else, and the ranking never has to
+choose between two records the policy wants. The published results would have
+been reproduced by `CATE > 0`.
+
+**Fix.** Two new strategies. `forbear_constrained` runs the allocator with
+`batch_budget = 0.3 × n`, which makes the constraint bind.
+`classifier_only` is the ablation: same allocator, same guard, same executor,
+`minimum_index = -inf`, so the model influences no decision it makes and what
+remains is the classifier's own rules.
+
+**Result, at n=500, seed 42.** forbear **+46,128**; classifier_only
+**−141,495**; a difference of **187,623** on a 252,350-rupee book. The
+ablation recovers *more* money — 117,981 against 70,104 — and is worth far
+less, because it churns 27 customers against 2. The classifier separates dead
+mandates from live ones; only the uplift model separates a persuadable
+customer from one who cancels when chased. Under a binding budget,
+`forbear_constrained` holds 0.647 recovered per attempt against 0.655
+unconstrained, on 150 attempts instead of 223, and stays net-positive at
++39,465.
+
+The model earns its complexity. Had it not, that would have gone here too.
+
+**And the budget turned out to matter more than expected.** At n=10,000,
+plain `forbear` is net-negative (−129,440) while `forbear_constrained` clears
+zero (**+86,786**) on a quarter of the attempts. The ceiling is what stops the
+allocator spending on marginal records once calibrated estimates stop skipping
+them — the constraint the Whittle index exists to price, absent from every
+result this project reported until now. Across 10 seeds at n=500 the same
+pattern holds: constrained is positive in 10/10 seeds against unconstrained's
+8/10, at a quarter of the variance.
+
+---
+
 ### 2026-08-24 — Net-negative finding at n=10,000
 
 **Symptom / finding, not a bug.** At n=500, Forbear's net value is positive
@@ -244,4 +375,18 @@ churn cost accumulates faster than the correctly-identified segments'
 recovered value does. Recorded as a finding rather than patched, per the
 project's standing instruction not to patch tests or numbers to make an
 inconvenient result disappear — the fix belongs in detection accuracy with
-production data, not in this codebase's arithmetic.
+better features, not in this codebase's arithmetic.
+
+**Correction, 2026-08-25.** This entry originally claimed the skip share
+"stays proportional to the book size (within the harness's stability
+tolerance)". That was measured at n=1,500 and is false at n=10,000, where the
+full run now completes: skip share falls from **55.4% at n=500 to 38.1%**,
+and `test_the_skip_list_scales_with_the_book` fails by 17.3 points against a
+15-point tolerance.
+
+The drift is the mechanism behind the net-negative result rather than a
+separate problem. Small samples produce noisier CATE estimates, more of them
+land below zero, and the system skips more than better-calibrated estimates
+would justify. Some of the n=500 profit was noise skipping in a profitable
+direction. Both this assertion and the net-value one are now
+`xfail(strict=True)` with the mechanism in the reason string.

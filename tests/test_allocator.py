@@ -150,19 +150,39 @@ async def test_without_a_notification_nothing_is_scheduled_inside_24_hours(conn)
     assert plan.scheduled[0].scheduled_at >= now + timedelta(hours=24)
 
 
-async def test_a_live_notification_allows_a_sooner_slot(conn):
-    """Notice already given, still inside its validity: the wait is served."""
+async def test_a_matured_notification_allows_a_sooner_slot(conn):
+    """Notice given yesterday: the customer has had their day, so the wait is
+    already served and the debit can go in the next legal window."""
     ids = await scenario(conn)
     now = await server_now(conn)
     await insert_notification(
-        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=1)
+        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=25)
     )
 
     plan = await allocate(conn, [scored(ids["record_id"], index=4.2)])
 
     assert plan.scheduled[0].scheduled_at < now + timedelta(hours=24)
     details = await audit_details(conn, ids["record_id"], ACTION_SCHEDULE)
-    assert details["chosen_for"]["notification_live"] is True
+    assert details["chosen_for"]["notification_usable"] is True
+
+
+async def test_a_fresh_notification_does_not_buy_a_sooner_slot(conn):
+    """The inverted-rule case, from the planning side.
+
+    A notification sent an hour ago is not notice yet. The allocator has to
+    wait for it to mature, or it would plan a debit the guard refuses - which
+    is exactly what happened while the guard's bound was the wrong way round.
+    """
+    ids = await scenario(conn)
+    now = await server_now(conn)
+    sent_at = now - timedelta(hours=1)
+    await insert_notification(
+        conn, ids["customer_id"], ids["subscription_id"], sent_at
+    )
+
+    plan = await allocate(conn, [scored(ids["record_id"], index=4.2)])
+
+    assert plan.scheduled[0].scheduled_at >= sent_at + timedelta(hours=24)
 
 
 async def test_a_prior_success_hour_is_preferred(conn):

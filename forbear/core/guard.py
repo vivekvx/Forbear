@@ -29,7 +29,8 @@ from forbear.config.limits import (
     ATTEMPT_COOLDOWN,
     IST,
     MAX_ATTEMPTS,
-    NOTIFICATION_VALIDITY,
+    NOTIFICATION_MAX_AGE,
+    NOTIFICATION_MIN_LEAD,
     NPCI_DEBIT_WINDOWS_IST,
 )
 from forbear.models.models import (
@@ -207,7 +208,17 @@ async def _check_execution_window_legal(
 async def _check_notification_sent(
     conn, record_id: int, action: ProposedAction, now: datetime
 ) -> GuardVerdict:
-    """A pre-debit notification for this subscription, still inside its window.
+    """A pre-debit notification for this subscription, old enough and not stale.
+
+    The direction matters and it is easy to get backwards. NPCI requires the
+    customer to be warned BEFORE the debit, so the notification has to have
+    aged past NOTIFICATION_MIN_LEAD to authorise anything. A notification sent
+    a minute ago is evidence that the customer has not had their day's notice,
+    not evidence that they have.
+
+    An earlier version of this rule read the bound the other way - accepting
+    anything sent within the last 24 hours - which permitted a debit ten
+    seconds after notifying and refused the one case that actually complied.
 
     Scoped to the subscription, not the customer: a notification about one
     mandate authorises a debit on that mandate and no other.
@@ -234,15 +245,6 @@ async def _check_notification_sent(
             reason="no_notification_found",
         )
 
-    valid_from = now - NOTIFICATION_VALIDITY
-    if sent_at < valid_from:
-        return _block(
-            RULE_NOTIFICATION,
-            subscription_id=subscription_id,
-            sent_at=sent_at.isoformat(),
-            valid_from=valid_from.isoformat(),
-            reason="notification_expired",
-        )
     if sent_at > now:
         # Not sent yet. Bad data, but fail closed rather than honour it.
         return _block(
@@ -252,7 +254,35 @@ async def _check_notification_sent(
             server_now=now.isoformat(),
             reason="notification_in_the_future",
         )
-    return _pass(subscription_id=subscription_id, sent_at=sent_at.isoformat())
+
+    age = now - sent_at
+
+    # Strict: exactly the lead time is not "at least" the lead time.
+    if age <= NOTIFICATION_MIN_LEAD:
+        return _block(
+            RULE_NOTIFICATION,
+            subscription_id=subscription_id,
+            sent_at=sent_at.isoformat(),
+            age_hours=round(age.total_seconds() / 3600, 3),
+            required_lead_hours=NOTIFICATION_MIN_LEAD.total_seconds() / 3600,
+            reason="insufficient_notification_lead",
+        )
+
+    if age > NOTIFICATION_MAX_AGE:
+        return _block(
+            RULE_NOTIFICATION,
+            subscription_id=subscription_id,
+            sent_at=sent_at.isoformat(),
+            age_hours=round(age.total_seconds() / 3600, 3),
+            maximum_age_hours=NOTIFICATION_MAX_AGE.total_seconds() / 3600,
+            reason="notification_expired",
+        )
+
+    return _pass(
+        subscription_id=subscription_id,
+        sent_at=sent_at.isoformat(),
+        age_hours=round(age.total_seconds() / 3600, 3),
+    )
 
 
 async def _check_duplicate_attempt(

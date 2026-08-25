@@ -31,7 +31,8 @@ from typing import Any, Iterable, NamedTuple, Optional
 from forbear.config.limits import (
     IST,
     MAX_ATTEMPTS,
-    NOTIFICATION_VALIDITY,
+    NOTIFICATION_MAX_AGE,
+    NOTIFICATION_MIN_LEAD,
     NPCI_DEBIT_WINDOWS_IST,
 )
 from forbear.core.audit import append_entry, server_now
@@ -122,7 +123,10 @@ class AllocationConfig:
     # How far ahead to schedule when no valid pre-debit notification exists
     # yet. The executor has to send one and the customer has to have a chance
     # to see it, so the next day is the earliest honest slot.
-    notification_lead: timedelta = NOTIFICATION_VALIDITY
+    # An hour past the regulatory minimum, not exactly on it. The guard's
+    # comparison is strict, and a slot planned to land on the boundary is a
+    # slot that any drift between planning and execution turns into a refusal.
+    notification_lead: timedelta = NOTIFICATION_MIN_LEAD + timedelta(hours=1)
     minimum_index: float = 0.0
 
 
@@ -569,21 +573,31 @@ async def allocate(
 
         success_hours, salary_day = patterns.get(facts.customer_id, (frozenset(), None))
 
-        # A notification already sent authorises a debit only until it expires;
-        # without one, the executor has to send one first and the customer needs
-        # the day the regulation gives them.
+        # A notification authorises a debit only once it has matured past the
+        # lead time, and only until it goes stale. So an existing notification
+        # opens a window that may not have started yet: one sent an hour ago is
+        # useful, but not until tomorrow.
+        #
+        # Without a usable notification the executor has to send a fresh one,
+        # and the customer gets the day the regulation gives them before
+        # anything is charged.
         notification_age = (
             now - facts.last_notification_at
             if facts.last_notification_at is not None
             else None
         )
-        has_live_notification = (
+        notification_is_usable = (
             notification_age is not None
-            and timedelta(0) <= notification_age <= NOTIFICATION_VALIDITY
+            and timedelta(0) <= notification_age <= NOTIFICATION_MAX_AGE
         )
-        if has_live_notification:
-            earliest = now
-            deadline = facts.last_notification_at + NOTIFICATION_VALIDITY
+        if notification_is_usable:
+            matured_at = (
+                facts.last_notification_at
+                + NOTIFICATION_MIN_LEAD
+                + timedelta(minutes=1)  # clear of the guard's strict boundary
+            )
+            earliest = max(now, matured_at)
+            deadline = facts.last_notification_at + NOTIFICATION_MAX_AGE
         else:
             earliest = now + config.notification_lead
             deadline = None
@@ -628,7 +642,7 @@ async def allocate(
                     "matched_prior_success_hour": slot.astimezone(IST).hour
                     in success_hours,
                     "inferred_salary_day": salary_day,
-                    "notification_live": has_live_notification,
+                    "notification_usable": notification_is_usable,
                 }
             },
         )

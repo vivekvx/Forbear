@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Everything Forbear claims, in one command, from nothing.
 
-Four sections, in the order the argument is made: here are five things that
+Four sections, in the order the argument is made: here are six things that
 must never happen and the system refusing each one; here is what the policy is
 worth against the platform's own schedule; here is the churn cost at which the
 answer flips; and here is all of it again at twenty times the size.
@@ -54,6 +54,7 @@ from tests.test_adversarial import (  # noqa: E402
     attack_attempt_cap_exceeded,
     attack_duplicate_webhook_replay,
     attack_expired_mandate,
+    attack_insufficient_notification_lead,
     attack_npci_window_violation,
     attack_revoked_mandate,
 )
@@ -71,7 +72,11 @@ CONNECTION_ATTACKS = (
     attack_expired_mandate,
     attack_attempt_cap_exceeded,
     attack_npci_window_violation,
+    attack_insufficient_notification_lead,
 )
+
+# Five run against a connection plus the webhook replay, which needs a pool.
+TOTAL_ATTACKS = len(CONNECTION_ATTACKS) + 1
 
 TRUNCATE_ALL = """
     TRUNCATE attempts, contacts, audit_log, at_risk_records,
@@ -85,7 +90,7 @@ def banner(title: str) -> None:
 
 
 async def adversarial_suite(pool) -> int:
-    """Five illegal inputs, five refusals. Returns the number blocked."""
+    """Six illegal inputs, six refusals. Returns the number blocked."""
     banner("ADVERSARIAL SUITE")
 
     blocked = 0
@@ -111,7 +116,7 @@ async def adversarial_suite(pool) -> int:
     async with pool.acquire() as conn:
         await conn.execute(TRUNCATE_ALL)
 
-    print(f"\n{blocked}/5 blocked.", flush=True)
+    print(f"\n{blocked}/{TOTAL_ATTACKS} blocked.", flush=True)
     return blocked
 
 
@@ -218,7 +223,7 @@ async def main(args: argparse.Namespace) -> int:
                 )
 
         banner("SUMMARY")
-        print(f"adversarial: {blocked}/5 illegal actions refused", flush=True)
+        print(f"adversarial: {blocked}/{TOTAL_ATTACKS} illegal actions refused", flush=True)
         if scale is not None:
             forbear = scale[STRATEGY_FORBEAR]
             print(
@@ -227,7 +232,7 @@ async def main(args: argparse.Namespace) -> int:
                 f"({forbear.records_skipped:,} records deliberately not chased)",
                 flush=True,
             )
-        return 0 if blocked == 5 else 1
+        return 0 if blocked == TOTAL_ATTACKS else 1
     finally:
         await pool.close()
         admin = await asyncpg.connect(ADMIN_DSN)

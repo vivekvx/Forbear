@@ -36,14 +36,16 @@ caller-supplied time would be a way to talk the NPCI windows into anything.
 from __future__ import annotations
 
 import contextlib
+import statistics
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
+from forbear.config.limits import NOTIFICATION_MIN_LEAD
 from forbear.core import guard
 from forbear.core.audit import server_now
 from forbear.generator.batch_generator import FailedDebit, generate_batch
@@ -54,7 +56,12 @@ from forbear.generator.outcome_simulator import (
     simulate_outcomes,
 )
 from forbear.generator.treatment_assignment import assign_treatment
-from forbear.scoring.uplift import FeatureRow, UpliftModel, build_feature_matrix
+from forbear.scoring.uplift import (
+    FeatureRow,
+    UpliftEvaluation,
+    UpliftModel,
+    build_feature_matrix,
+)
 from forbear.scoring.whittle import RecordScore, compute_indices
 from forbear.services import baseline, unconstrained_baseline
 from forbear.services.allocator import (
@@ -74,8 +81,31 @@ from forbear.services.executor import (
 
 STRATEGY_FIXED = "fixed_schedule"
 STRATEGY_FORBEAR = "forbear"
+STRATEGY_FORBEAR_CONSTRAINED = "forbear_constrained"
+STRATEGY_CLASSIFIER_ONLY = "classifier_only"
 STRATEGY_UNCONSTRAINED = "unconstrained"
-STRATEGIES = (STRATEGY_FIXED, STRATEGY_FORBEAR, STRATEGY_UNCONSTRAINED)
+STRATEGIES = (
+    STRATEGY_FIXED,
+    STRATEGY_FORBEAR,
+    STRATEGY_FORBEAR_CONSTRAINED,
+    STRATEGY_CLASSIFIER_ONLY,
+    STRATEGY_UNCONSTRAINED,
+)
+
+# The three policies that plan through Forbear's own allocator, and therefore
+# pay Forbear's compliance cost: notice periods, NPCI windows, cooldowns, the
+# attempt cap. The two baselines do not, which is the conservative direction -
+# see the note at the guard dispatch in run_comparison.
+FORBEAR_FAMILY = (
+    STRATEGY_FORBEAR,
+    STRATEGY_FORBEAR_CONSTRAINED,
+    STRATEGY_CLASSIFIER_ONLY,
+)
+
+# How far ahead of each slot the simulated sender posts the pre-debit notice.
+# An hour clear of the regulatory minimum, matching what the allocator plans
+# for, so a slot is not refused over the boundary the guard compares strictly.
+NOTIFICATION_STUB_LEAD = NOTIFICATION_MIN_LEAD + timedelta(hours=1)
 
 # Hours a debit has historically succeeded at, all inside NPCI windows. Real
 # books have this pattern; the allocator reads it back out of attempt history
@@ -87,6 +117,14 @@ HISTORY_HOURS = (9, 14, 22)
 class HarnessConfig:
     treatment_rate: float = 0.5
     batch_budget: Optional[int] = None
+    # Share of the book forbear_constrained is allowed to attempt. The plain
+    # forbear strategy runs with no batch ceiling at all, which means its
+    # Whittle index only ever decides sign - everything above the threshold is
+    # scheduled, so the ranking never has to choose between two records it
+    # wants. This ratio makes the constraint bind, which is the only condition
+    # under which an index-based allocator is doing anything a filter could
+    # not.
+    constrained_budget_ratio: float = 0.3
     # Long enough to reach the next salary day. A horizon shorter than a
     # billing cycle would stop the allocator waiting for payday, which is the
     # behaviour under test.
@@ -131,7 +169,16 @@ class StrategyResult:
     skips_by_reason: dict[str, int] = field(default_factory=dict)
 
 
-ComparisonResult = dict[str, StrategyResult]
+class ComparisonResult(dict):
+    """Strategy name -> StrategyResult, with the model evaluation attached.
+
+    A dict subclass rather than a wrapper, because every caller indexes this by
+    strategy name and none of them should have to change. The uplift evaluation
+    is a property of the comparison rather than of any one policy, so it rides
+    alongside instead of being copied into five identical rows.
+    """
+
+    uplift: Optional[UpliftEvaluation] = None
 
 
 @dataclass(frozen=True)
@@ -484,10 +531,16 @@ async def _send_notifications(conn, world: _World, plan, lead: timedelta) -> Non
     """The executor's pre-debit notification step, stubbed for simulation.
 
     In production the executor sends this and the guard checks it landed. Here
-    the notice is written straight to the contacts table a couple of hours
-    before each slot, which is what a compliant sender would have produced.
-    Skipping it would make every attempt fail the guard's notification rule,
-    and the comparison would be measuring the stub rather than the policy.
+    the notice is written straight to the contacts table, dated far enough
+    before each slot to satisfy the regulatory lead time, which is what a
+    compliant sender would have produced. Skipping it would make every attempt
+    fail the guard's notification rule, and the comparison would be measuring
+    the stub rather than the policy.
+
+    The lead used to be two hours, which the guard accepted while its bound was
+    reversed. Once the rule was corrected that stub blocked every attempt in
+    the Forbear family - the harness was not compliant and nothing had been
+    able to say so.
     """
     if not plan.scheduled:
         return
@@ -596,10 +649,15 @@ async def run_comparison(
             for record in batch
         ]
     )
-    model = UpliftModel(seed=seed).fit(X, treatment, outcome)
+    model = UpliftModel(seed=seed)
+    # Held out before anything is scored, so the number reported next to the
+    # table is the model's performance on records it never saw. The in-sample
+    # figure runs several times higher and is kept only to show the gap.
+    evaluation = model.fit_and_evaluate(X, treatment, outcome)
     cate = model.predict_cate(X)
 
-    results: ComparisonResult = {}
+    results = ComparisonResult()
+    results.uplift = evaluation
 
     for strategy in STRATEGIES:
         started = time.perf_counter()
@@ -632,13 +690,34 @@ async def run_comparison(
         # (f) Plan.
         if strategy == STRATEGY_FIXED:
             plan = await baseline.allocate_fixed_schedule(conn, world.record_ids)
-        elif strategy == STRATEGY_FORBEAR:
+        elif strategy in FORBEAR_FAMILY:
+            if strategy == STRATEGY_FORBEAR_CONSTRAINED:
+                budget = int(round(config.constrained_budget_ratio * n_records))
+                minimum_index = 0.0
+            elif strategy == STRATEGY_CLASSIFIER_ONLY:
+                # The ablation. Same allocator, same compliance, same
+                # everything - except that no record is ever refused for what
+                # the model thinks of it. A threshold of -inf disables the
+                # value test, and with no batch ceiling the ranking never has
+                # to break a tie, so the uplift estimate influences no decision
+                # this policy makes. What is left is the classifier: terminal
+                # failure classes and dead mandates still get skipped.
+                #
+                # If this scores what forbear scores, the model and the index
+                # earned nothing and the honest thing is to say so.
+                budget = None
+                minimum_index = float("-inf")
+            else:
+                budget = config.batch_budget
+                minimum_index = 0.0
+
             plan = await allocate(
                 conn,
                 scored_records,
                 AllocationConfig(
-                    batch_budget=config.batch_budget,
+                    batch_budget=budget,
                     horizon_days=config.horizon_days,
+                    minimum_index=minimum_index,
                 ),
             )
         else:
@@ -654,8 +733,8 @@ async def run_comparison(
         )
         clock = VirtualClock(now)
 
-        if strategy == STRATEGY_FORBEAR:
-            # Only Forbear runs through Forbear's guard. That is the
+        if strategy in FORBEAR_FAMILY:
+            # Only the Forbear family runs through Forbear's guard. That is the
             # conservative direction for the claim being tested: the policy
             # under test pays the compliance cost - notice periods, NPCI
             # windows, cooldowns, the cap - and the two policies it is measured
@@ -664,7 +743,7 @@ async def run_comparison(
             # at whatever hour the invoice failed, so most of its attempts land
             # outside an NPCI window, and it would score zero for reasons that
             # have nothing to do with its policy.
-            await _send_notifications(conn, world, plan, timedelta(hours=2))
+            await _send_notifications(conn, world, plan, NOTIFICATION_STUB_LEAD)
             with simulated_guard_clock(clock) as guard_fn:
                 report = await execute_plan(conn, plan, guard_fn, execute_fn, clock)
         else:
@@ -741,6 +820,163 @@ def _score_strategy(
     )
 
 
+@dataclass(frozen=True)
+class MetricSummary:
+    """One metric across seeds. The spread is the point, not the mean."""
+
+    mean: float
+    stdev: float
+    minimum: float
+    maximum: float
+    values: tuple[float, ...]
+
+    @property
+    def positive_share(self) -> float:
+        return sum(1 for value in self.values if value > 0) / len(self.values)
+
+
+# strategy -> metric name -> summary across seeds.
+MultiSeedResult = dict[str, dict[str, MetricSummary]]
+
+# The metrics worth carrying into a headline table. Everything else is
+# diagnostic and can be read off a single run.
+SUMMARISED_METRICS = (
+    "amount_recovered",
+    "recovery_rate",
+    "attempts_consumed",
+    "recovered_per_attempt",
+    "records_skipped",
+    "churned_count",
+    "ltv_lost_to_churn",
+    "net_value",
+)
+
+
+async def run_multi_seed(
+    conn,
+    seeds: Sequence[int],
+    n_records: int,
+    config: Optional[HarnessConfig] = None,
+) -> tuple[MultiSeedResult, MetricSummary]:
+    """The comparison, repeated, so the table can report a spread.
+
+    One seed is one draw of a synthetic world, and quoting it as though it were
+    the system's performance is how a number ends up 40% above the mean of its
+    own distribution. Two of the first twelve seeds tried here came out
+    net-negative while the headline seed was comfortably positive.
+
+    Each seed runs inside a savepoint that is rolled back, so ten comparisons
+    do not accumulate ten books' worth of rows and advisory locks in one
+    transaction.
+
+    Returns the per-strategy summaries and, separately, the held-out Qini
+    across seeds - a model diagnostic rather than a policy metric.
+    """
+    if not conn.is_in_transaction():
+        raise RuntimeError("run_multi_seed must run inside a transaction")
+    if len(seeds) < 2:
+        raise ValueError("a spread needs at least two seeds")
+
+    collected: dict[str, dict[str, list[float]]] = {
+        strategy: {metric: [] for metric in SUMMARISED_METRICS}
+        for strategy in STRATEGIES
+    }
+    qini_values: list[float] = []
+
+    for seed in seeds:
+        savepoint = conn.transaction()
+        await savepoint.start()
+        try:
+            result = await run_comparison(
+                conn, seed=seed, n_records=n_records, config=config
+            )
+            for strategy in STRATEGIES:
+                metrics = result[strategy]
+                for metric in SUMMARISED_METRICS:
+                    collected[strategy][metric].append(float(getattr(metrics, metric)))
+            if result.uplift is not None:
+                qini_values.append(result.uplift.held_out_qini)
+        finally:
+            await savepoint.rollback()
+
+    def summarise(values: list[float]) -> MetricSummary:
+        return MetricSummary(
+            mean=statistics.mean(values),
+            stdev=statistics.stdev(values),
+            minimum=min(values),
+            maximum=max(values),
+            values=tuple(values),
+        )
+
+    summaries: MultiSeedResult = {
+        strategy: {
+            metric: summarise(values) for metric, values in metrics.items()
+        }
+        for strategy, metrics in collected.items()
+    }
+    return summaries, summarise(qini_values)
+
+
+def format_multi_seed(
+    summaries: MultiSeedResult, qini: MetricSummary, seeds: Sequence[int]
+) -> str:
+    """Mean plus or minus one standard deviation, per strategy."""
+    rows = [
+        ("amount recovered", "amount_recovered", "rupees"),
+        ("recovery rate", "recovery_rate", "rate"),
+        ("attempts consumed", "attempts_consumed", "count"),
+        ("recovered per attempt", "recovered_per_attempt", "ratio"),
+        ("records skipped", "records_skipped", "count"),
+        ("customers churned", "churned_count", "count"),
+        ("ltv lost to churn", "ltv_lost_to_churn", "rupees"),
+        ("NET VALUE", "net_value", "rupees"),
+    ]
+
+    def render(summary: MetricSummary, kind: str) -> str:
+        if kind == "rupees":
+            return f"{summary.mean / 100:,.0f} ± {summary.stdev / 100:,.0f}"
+        if kind == "rate":
+            return f"{summary.mean:.1%} ± {summary.stdev:.1%}"
+        if kind == "ratio":
+            return f"{summary.mean:.3f} ± {summary.stdev:.3f}"
+        return f"{summary.mean:,.0f} ± {summary.stdev:,.0f}"
+
+    label_width = max(len(label) for label, _, _ in rows) + 2
+    columns = list(STRATEGIES)
+    column_width = 24
+
+    header = f"metric (mean ± σ, {len(seeds)} seeds)".ljust(label_width) + "".join(
+        name.rjust(column_width) for name in columns
+    )
+    lines = [header, "-" * len(header)]
+    for label, metric, kind in rows:
+        if label == "NET VALUE":
+            lines.append("-" * len(header))
+        lines.append(
+            label.ljust(label_width)
+            + "".join(
+                render(summaries[name][metric], kind).rjust(column_width)
+                for name in columns
+            )
+        )
+
+    lines.append("")
+    for name in columns:
+        net = summaries[name]["net_value"]
+        lines.append(
+            f"  {name:22s} net value positive in "
+            f"{net.positive_share * len(seeds):.0f}/{len(seeds)} seeds  "
+            f"(min {net.minimum / 100:,.0f}, max {net.maximum / 100:,.0f})"
+        )
+    lines.append("")
+    lines.append(
+        f"  held-out Qini across seeds: {qini.mean:.4f} ± {qini.stdev:.4f} "
+        f"(min {qini.minimum:.4f}, max {qini.maximum:.4f})"
+    )
+
+    return "\n".join(lines)
+
+
 def rupees(paise: int) -> str:
     return f"{paise / 100:,.0f}"
 
@@ -779,6 +1015,16 @@ def format_comparison(result: ComparisonResult) -> str:
         lines.append(
             label.ljust(label_width)
             + "".join(render(result[name]).rjust(column_width) for name in columns)
+        )
+
+    evaluation = getattr(result, "uplift", None)
+    if evaluation is not None:
+        lines.append("")
+        lines.append(
+            f"uplift model: held-out Qini {evaluation.held_out_qini:.4f} "
+            f"(in-sample {evaluation.in_sample_qini:.4f}, "
+            f"overstates by {evaluation.overstatement:.1f}x; "
+            f"train {evaluation.n_train:,} / test {evaluation.n_test:,})"
         )
 
     return "\n".join(lines)

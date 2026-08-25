@@ -42,6 +42,7 @@ from forbear.core.guard import (
     RULE_EXECUTION_WINDOW,
     RULE_MANDATE_NOT_EXPIRED,
     RULE_MANDATE_NOT_REVOKED,
+    RULE_NOTIFICATION,
     guard_check,
 )
 from forbear.models.models import ActionKind, ProposedAction
@@ -117,14 +118,18 @@ async def plant_target(
     *,
     mandate_status: str = "active",
     attempts: int = 0,
-    notification_age: Optional[timedelta] = timedelta(hours=1),
+    # 25 hours: past the 24h regulatory lead, inside the 7-day staleness bound.
+    # This default used to be one hour, which is not a compliant notification -
+    # the record every attack calls "clean" was itself illegal to charge, and
+    # the suite could not see it because no rule enforced the lead time.
+    notification_age: Optional[timedelta] = timedelta(hours=25),
     now: Optional[datetime] = None,
 ) -> dict[str, int]:
     """One attractive record, built from scratch.
 
     No shared fixture. Everything an attack depends on - the mandate state, the
     attempt history, the notification - is set here, so a change to the guard
-    tests' setup can never quietly change what these five attacks mean.
+    tests' setup can never quietly change what these attacks mean.
     """
     now = now or await conn.fetchval("SELECT now()")
     tag = uuid.uuid4().hex[:10]
@@ -287,6 +292,34 @@ async def attack_npci_window_violation(conn) -> AttackResult:
     )
 
 
+async def attack_insufficient_notification_lead(conn) -> AttackResult:
+    """Notify the customer, then debit them an hour later.
+
+    NPCI requires the warning to arrive at least a day before the money moves.
+    An hour is a notification in form and not in substance: the customer has
+    had no chance to move funds or object. The guard shipped with this bound
+    reversed for a while, permitting a debit ten seconds after notifying, which
+    is why this attack exists and why the demo prints it.
+    """
+    now = await conn.fetchval("SELECT now()")
+    legal = legal_moment(now)
+    ids = await plant_target(conn, notification_age=timedelta(hours=1), now=legal)
+
+    with pinned_clock(legal):
+        verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
+
+    return AttackResult(
+        attack="insufficient notification lead",
+        blocked=not verdict.allowed,
+        rule=verdict.rule_name,
+        summary=_line(
+            "insufficient notification lead",
+            verdict.rule_name or "none",
+            "1h notice, 24h required",
+        ),
+    )
+
+
 async def attack_duplicate_webhook_replay(pool) -> AttackResult:
     """Razorpay redelivers. The same failure must not become two debts.
 
@@ -392,6 +425,51 @@ async def test_npci_window_violation_blocked(conn):
 
     assert result.blocked
     assert result.rule == RULE_EXECUTION_WINDOW
+
+
+async def test_insufficient_notification_lead_blocked(conn):
+    result = await attack_insufficient_notification_lead(conn)
+    print("\n" + result.summary)
+
+    assert result.blocked
+    assert result.rule == RULE_NOTIFICATION
+
+
+@pytest.mark.parametrize(
+    ("label", "age", "allowed"),
+    [
+        ("10 seconds", timedelta(seconds=10), False),
+        ("1 hour", timedelta(hours=1), False),
+        ("23 hours", timedelta(hours=23), False),
+        # Strict: "at least 24 hours" is not satisfied by exactly 24 hours.
+        ("24 hours exactly", timedelta(hours=24), False),
+        ("25 hours", timedelta(hours=25), True),
+        ("8 days", timedelta(days=8), False),
+    ],
+)
+async def test_the_notification_lead_window_at_every_boundary(
+    conn, label, age, allowed
+):
+    """The rule that was inverted, pinned at both ends.
+
+    Only the 25-hour case may charge. Everything below the lead time is a
+    customer who has not had their notice, and eight days is consent gone
+    stale - one notification must not authorise debits forever.
+    """
+    now = await conn.fetchval("SELECT now()")
+    legal = legal_moment(now)
+    ids = await plant_target(conn, notification_age=age, now=legal)
+
+    with pinned_clock(legal):
+        verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
+
+    assert verdict.allowed is allowed, f"{label}: expected allowed={allowed}"
+    if not allowed:
+        assert verdict.rule_name == RULE_NOTIFICATION
+        assert verdict.details["reason"] in {
+            "insufficient_notification_lead",
+            "notification_expired",
+        }
 
 
 async def test_duplicate_webhook_replay(clean_db, monkeypatch):

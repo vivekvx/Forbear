@@ -110,35 +110,94 @@ of approximating it in closed form, which matters most for records with a
 long remaining subscription term where the one-period approximation is
 furthest from the discounted infinite-horizon answer.
 
-**Evaluation.** Qini coefficient against the generator's ground-truth
-counterfactuals (never visible to the scorer or allocator at runtime — only
-to the offline evaluation code). Score: **0.3749**, against **0.0279** on the
-same data with treatment labels shuffled. The model is finding real signal,
-not memorising the generator's noise.
+**Evaluation.** Qini coefficient, measured on a held-out 30% that the model
+never saw. `UpliftModel.fit_and_evaluate` splits stratified on the
+treatment/outcome pair, fits on the remainder, and scores the holdout.
+
+**Held-out Qini: 0.0907.** In-sample on the same data: 0.4243.
+
+The in-sample figure overstates discrimination by roughly **4.7x**, and an
+earlier version of this document reported 0.3749 — an in-sample number —
+as though it were the model's performance. It was not. Gradient boosting
+memorises, so scoring on the fitted rows measures memorisation rather than
+ranking quality, and the gap here is most of the number rather than a
+rounding detail. The held-out score is small but real: a shuffled ranking
+scores near zero, so the model is finding signal, just far less of it than
+the in-sample figure claimed.
 
 ## 4. Results
 
-### n=500
+### n=500, five strategies (seed 42)
 
-| Metric | Fixed Schedule | Forbear | Delta |
-|---|---|---|---|
-| ₹ recovered | 73,255 | 70,104 | −4.3% |
-| Recovery rate | 29.0% | 29.2% | +0.2pp |
-| Attempts consumed | 1,183 | 223 | −81% |
-| ₹ recovered/attempt | 0.123 | 0.655 | +5.3x |
-| Customers churned | 36 | 2 | −94% |
-| LTV lost to churn | 364,968 | 23,976 | −93% |
-| Net value | −291,713 | +46,128 | +337,841 |
-| Records deliberately skipped | 0 | 277 | — |
+| Metric | fixed_schedule | forbear | forbear_constrained | classifier_only | unconstrained |
+|---|---|---|---|---|---|
+| ₹ recovered | 73,255 | 70,104 | 51,453 | 117,981 | 164,802 |
+| Recovery rate | 29.0% | 29.2% | 19.4% | 43.8% | 59.6% |
+| Attempts consumed | 1,183 | 223 | 150 | 367 | 1,268 |
+| ₹ recovered/attempt | 0.123 | 0.655 | 0.647 | 0.597 | 0.235 |
+| Records skipped | 45 | 277 | 350 | 133 | 133 |
+| Customers churned | 36 | 2 | 1 | 27 | 27 |
+| LTV lost to churn | 364,968 | 23,976 | 11,988 | 259,476 | 259,476 |
+| **Net value** | **−291,713** | **+46,128** | **+39,465** | **−141,495** | **−94,674** |
 
-### n=10,000
+### The ablation: does the model earn its complexity?
 
-Forbear: net value **−129,440**. Fixed schedule: net value **−7,628,738**.
-Forbear is net-negative at this scale, but loses **59x less** than the
-baseline it replaces. The absolute loss traces to do-not-disturb detection
-accuracy of 51% — the model gets the *direction* right (negative CATE) but
-misses roughly half the individuals in that segment, so it still spends
-attempt budget contacting customers it should have left alone.
+`classifier_only` is the control. It runs the same allocator, the same guard,
+the same executor, with one thing removed: the value threshold. The uplift
+estimate influences no decision it makes, so whatever separates it from
+`forbear` is what the model and the Whittle index are worth.
+
+**forbear +46,128 against classifier_only −141,495 — a difference of 187,623
+rupees on a 252,350-rupee book.**
+
+The mechanism is the whole thesis in one row. `classifier_only` recovers
+**more** money than Forbear — 117,981 against 70,104 — and is worth far less,
+because it churns 27 customers instead of 2. The classifier can tell a dead
+mandate from a live one, which is why both policies skip the same terminal
+failures. What it cannot do is tell a persuadable customer from one who
+cancels when chased; only the uplift model carries that, and it is the
+difference between a policy that clears zero and one that loses money faster
+than the platform default it replaces.
+
+`forbear_constrained` answers the other half. Every number this project
+reported before it existed was produced with **no batch ceiling at all**,
+which meant the Whittle index only ever decided sign — everything above the
+threshold got scheduled, so the ranking never had to choose between two
+records it wanted. Under a binding budget of 0.3 × n it holds up: 0.647
+recovered per attempt against the unconstrained policy's 0.655, on 150
+attempts instead of 223, and still comfortably net-positive. The index
+degrades gracefully when it actually has to allocate.
+
+### n=10,000, five strategies (seed 42, 181s)
+
+| Metric | fixed_schedule | forbear | forbear_constrained | classifier_only | unconstrained |
+|---|---|---|---|---|---|
+| ₹ recovered | 1,543,114 | 1,444,300 | 888,410 | 2,441,507 | 3,528,561 |
+| Recovery rate | 31.4% | 36.0% | 17.9% | 44.9% | 62.4% |
+| Attempts consumed | 23,873 | 6,186 | 3,000 | 7,671 | 26,179 |
+| ₹ recovered/attempt | 0.131 | 0.582 | 0.597 | 0.586 | 0.238 |
+| Customers churned | 729 | 205 | 98 | 615 | 615 |
+| LTV lost to churn | 9,171,852 | 1,573,740 | 801,624 | 7,667,820 | 7,667,820 |
+| **Net value** | **−7,628,738** | **−129,440** | **+86,786** | **−5,226,313** | **−4,139,259** |
+
+Held-out Qini at this size: **0.1155** (in-sample 0.2298).
+
+**The binding budget is what carries the thesis at scale.** Plain `forbear`
+is net-negative here — −129,440, a 59x smaller loss than the fixed schedule
+but a loss. `forbear_constrained`, the same policy under a ceiling of 0.3 × n,
+clears zero at **+86,786**.
+
+The reason is the mechanism in §5. As estimates calibrate, fewer records fall
+below the value threshold, so an unconstrained Forbear schedules more marginal
+attempts and pays their churn cost. A binding budget makes that impossible:
+with only 3,000 attempts for 10,000 records, the Whittle index has to rank
+rather than merely filter, and the marginal records lose to the good ones. It
+consumes a quarter of the attempts, churns half as many customers as plain
+Forbear, and is the only selective policy that clears zero at this size.
+
+This is the condition under which an index-based allocator is doing something
+a threshold could not — and every result this project reported before the
+constrained strategy existed was produced without it.
 
 ### Sensitivity sweep
 
@@ -169,12 +228,26 @@ model from trivially inferring segment from treatment-outcome pairs, but they
 do not remove the underlying circularity: the generator and the model are
 built from the same conceptual segmentation.
 
-**Do-not-disturb detection accuracy is 51%.** The system gets the sign right
-— negative CATE — but on individual records it is barely better than a coin
-flip at identifying which specific customers are do-not-disturb. This is the
-single largest driver of the gap between n=500 (net positive) and n=10,000
-(net negative): at 10x the volume, the false negatives in this segment
-accumulate into real churn cost.
+**Do-not-disturb detection accuracy is 51%, and more data does not fix it.**
+The system gets the sign right — negative CATE — but on individual records it
+is barely better than a coin flip at identifying which specific customers are
+do-not-disturb.
+
+Improving this requires **better features — payment timing, app session data,
+complaint history — not more rows.** Measured across 8 seeds, detection
+accuracy went from 59% at n=2,000 to 55% at n=8,000: quadrupling the data made
+it slightly *worse*, not better. An earlier version of this document called
+"improving detection to 70% with production data" the first priority, which
+was wrong in its mechanism — volume is not the binding constraint. The
+features the model currently sees (plan tier, tenure, failure code, hour,
+day-of-month, attempt count, days since contact) do not separate a customer
+who resents being chased from one who simply forgot, and no amount of data
+makes an absent signal present.
+
+One mitigating measurement: only 13.3% of do-not-disturb records land in the
+top half of the ranking, so the ordering is better than the 51% sign-accuracy
+figure implies. Accuracy counts individual signs; the allocator only needs
+the ranking.
 
 **The churn coefficient is an assumption, not a measurement.** The
 sensitivity sweep shows exactly where the decision boundary sits as a
@@ -183,22 +256,74 @@ what that rate actually is for a real merchant's customers. The 0.15
 crossover is only as good as whatever rate gets plugged in for a live
 deployment.
 
-**At n=10,000, Forbear is net-negative.** −129,440 rupees. The thesis holds
-in relative terms — 59x smaller a loss than the fixed schedule — but absolute
-profitability at this scale requires closing the do-not-disturb detection
-gap with real data. This is stated plainly because it is the honest number,
-not because it is comfortable.
+**At n=10,000, unconstrained Forbear is net-negative.** −129,440 rupees,
+against the fixed schedule's −7,628,738. The thesis holds in relative terms —
+59x smaller a loss — but the policy as originally configured loses money at
+this size, and that is a finding rather than a footnote.
 
-**Advisory lock ceiling in the measurement harness.** `append_entry` takes a
-transaction-scoped advisory lock per entity so two writers cannot fork the
-same audit chain. The harness runs an entire comparison — three strategies,
-one world each — inside a single transaction, so locks accumulate across the
-whole run: three worlds × n records each. Past roughly 1,700 records on a
-default PostgreSQL configuration (`max_locks_per_transaction=64`), the
-harness cannot complete a comparison in one transaction. Production does not
-hit this: each decision commits and releases its lock immediately. This is a
-property of measuring a whole cycle atomically, not of the system being
-measured — see the engineering log for the incident.
+The same policy under a binding budget (`forbear_constrained`, 0.3 × n) clears
+zero at **+86,786**, so the defect is in running the allocator without a
+ceiling rather than in the allocator. That does not make the unconstrained
+result go away: it was the configuration every earlier number in this project
+was produced under.
+
+**The mechanism, which is more useful than the number.** Skip share collapses
+from **55.4% at n=500 to 38.1% at n=10,000**, and `negative_net_value` skips
+roughly halve as a share of the book. Better-calibrated CATE estimates cross
+zero less often: at n=500 the estimates are noisy, more records land below the
+threshold, the system skips more, and churn stays at 0.4%. At n=10,000 the
+model is better calibrated, fewer records are refused, churn rises to 2.1%,
+and net value goes negative.
+
+**So the n=500 profit is partly a small-sample artefact** — noise was doing
+some of the skipping, and it happened to skip in a profitable direction. The
+policy is sound; the discrimination underneath it is too weak to carry the
+policy at volume. That is the same conclusion the held-out Qini of 0.0907
+reaches from the other direction, and the two agreeing is the reason to
+believe either.
+
+The three `test_scale.py` assertions that encode these claims are marked
+`xfail(strict=True)` rather than retuned or deleted. They are the claims the
+project makes; recording that they currently fail, with the mechanism in the
+reason string, is the honest arrangement. `strict=True` means that fixing
+detection turns them red and forces the finding to be rewritten rather than
+silently kept.
+
+**Advisory lock ceiling in the measurement harness — resolved.**
+`append_entry` takes a transaction-scoped advisory lock per entity so two
+writers cannot fork the same audit chain. The harness runs an entire
+comparison inside a single transaction, so locks accumulate across the whole
+run: one world per strategy × n records each. On a default PostgreSQL
+configuration (`max_locks_per_transaction=64`) that capped comparisons at
+roughly 1,700 records.
+
+Raising `max_locks_per_transaction` to **600** removed the ceiling: the full
+n=10,000 comparison now completes in **137 seconds**. `test_scale.py` still
+computes the limit from the live server settings and skips with the exact
+arithmetic if a machine cannot support the run, so the suite stays honest on
+a default configuration. Production never had this constraint — each decision
+commits and releases its lock immediately; it was a property of measuring a
+whole cycle atomically. Committing per chunk would remove the dependency on
+server configuration entirely and remains worth doing.
+
+**Headline numbers are one seed, and the spread is wide.** Across 12 seeds at
+n=500, Forbear's net value averaged 32,003 with a standard deviation of
+23,230, and **2 of 12 seeds came out net-negative**. Seed 42, the number
+quoted throughout this document, is roughly 0.6σ above the mean of its own
+distribution. Two claims in particular do not survive averaging: recovered
+rupees are −12.7% against the fixed schedule rather than −4.3%, and recovery
+rate is −0.35pp rather than +0.2pp, worse in 6 of 12 seeds. The *relative*
+thesis is robust — Forbear beat the fixed schedule in 12 of 12 seeds and the
+unconstrained policy in 12 of 12 — but any single absolute figure should be
+read as one draw. `run_multi_seed` now reports mean ± σ, and the README table
+leads with it.
+
+**The API has no authentication.** `/stream/run` triggers a full allocation
+cycle for anyone who can reach the port, CORS is `allow_origins=["*"]`, and
+the app runs DDL at startup to create its own schema. This is a deliberate
+choice for a single-screen local demo and an unacceptable one anywhere else.
+The stream endpoint rolls its transaction back and writes nothing permanent,
+which limits the blast radius to compute.
 
 **Cold start.** The allocator's history lookup needs prior debit records to
 infer a customer's likely salary-timing window. Two seeded invoices per
@@ -211,10 +336,11 @@ population default.
 1. **Measure real dunning-churn-per-contact.** One number settles the
    sensitivity sweep and replaces the assumption in §5 with a measurement.
    This is the single highest-leverage next step.
-2. **Replace synthetic profiles with observed payment history.** The
-   T-Learner's feature set (`forbear/scoring/uplift.py`) is already designed
-   around observable signals — plan tier, tenure, prior failure codes — not
-   ground-truth segment, so this is a data-source swap, not a redesign.
+2. **Add features that carry the do-not-disturb signal**, rather than more
+   rows of the ones already there — payment timing relative to salary day, app
+   session activity, complaint and support-ticket history. The measurement in
+   §5 is that volume does not move detection accuracy; the current feature set
+   does not contain the signal, and this is the change that would.
 3. **Per-chunk commits in the harness** to remove the advisory-lock ceiling
    at scale, so measurement at n=10,000+ no longer needs a lock-capacity
    workaround.

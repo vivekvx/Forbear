@@ -21,6 +21,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from forbear.api import stream
+from forbear.services.harness import STRATEGIES
 
 N_RECORDS = 30
 SEED = 42
@@ -211,18 +212,14 @@ async def test_the_counters_only_move_forward(client, events_holder):
         assert values == sorted(values), f"{field} moved backwards"
 
 
-async def test_the_summary_closes_the_stream_with_all_three_strategies(
+async def test_the_summary_closes_the_stream_with_every_strategy(
     client, events_holder
 ):
     events = await get_events(client, events_holder)
 
     assert events[-1][0] == "summary", "the summary is not the last frame"
     summary = events[-1][1]
-    assert set(summary["strategies"]) == {
-        "fixed_schedule",
-        "forbear",
-        "unconstrained",
-    }
+    assert set(summary["strategies"]) == set(STRATEGIES)
     for metrics in summary["strategies"].values():
         for field in (
             "amount_at_risk",

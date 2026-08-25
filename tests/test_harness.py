@@ -21,9 +21,14 @@ from forbear.services.allocator import (
     SKIP_TERMINAL_FAILURE_CLASS,
 )
 from forbear.services.harness import (
+    STRATEGIES,
+    STRATEGY_CLASSIFIER_ONLY,
     STRATEGY_FIXED,
     STRATEGY_FORBEAR,
+    STRATEGY_FORBEAR_CONSTRAINED,
     STRATEGY_UNCONSTRAINED,
+    format_multi_seed,
+    run_multi_seed,
     HarnessConfig,
     format_comparison,
     run_comparison,
@@ -56,10 +61,10 @@ async def get_comparison(conn, comparison_holder: dict):
 # --- a, b, g. the run and the table ----------------------------------------
 
 
-async def test_all_three_strategies_produce_results(conn, comparison_holder):
+async def test_every_strategy_produces_results(conn, comparison_holder):
     result = await get_comparison(conn, comparison_holder)
 
-    assert set(result) == {STRATEGY_FIXED, STRATEGY_FORBEAR, STRATEGY_UNCONSTRAINED}
+    assert set(result) == set(STRATEGIES)
     for metrics in result.values():
         assert metrics.records_processed == RECORDS
         assert metrics.amount_at_risk > 0
@@ -227,3 +232,83 @@ async def test_a_batch_budget_caps_forbear_without_capping_the_baseline(conn):
 
     assert result[STRATEGY_FORBEAR].attempts_consumed <= 10
     assert result[STRATEGY_FIXED].attempts_consumed > 10
+
+
+# --- the ablation ----------------------------------------------------------
+
+
+async def test_the_model_beats_the_classifier_it_is_built_on(conn, comparison_holder):
+    """The question the whole architecture answers to.
+
+    classifier_only runs the same allocator, the same guard and the same
+    execution, with the value threshold removed - so the uplift estimate
+    influences nothing it does. Whatever separates the two columns is what the
+    model and the index are worth.
+
+    If this ever reverses, the finding is that the model earns nothing, and
+    that belongs in the write-up rather than in a retuned threshold.
+    """
+    result = await get_comparison(conn, comparison_holder)
+    forbear = result[STRATEGY_FORBEAR]
+    ablation = result[STRATEGY_CLASSIFIER_ONLY]
+
+    print(
+        f"\nablation: forbear net {forbear.net_value / 100:,.0f} vs "
+        f"classifier_only {ablation.net_value / 100:,.0f}  "
+        f"(recovered {forbear.amount_recovered / 100:,.0f} vs "
+        f"{ablation.amount_recovered / 100:,.0f}, "
+        f"churned {forbear.churned_count} vs {ablation.churned_count})"
+    )
+
+    assert forbear.net_value > ablation.net_value
+
+
+async def test_the_classifier_only_ablation_still_honours_the_classifier(
+    conn, comparison_holder
+):
+    """It drops the model, not the rules. A record no attempt can recover is
+    still skipped, or the ablation would be measuring a broken policy rather
+    than a simpler one."""
+    result = await get_comparison(conn, comparison_holder)
+    reasons = result[STRATEGY_CLASSIFIER_ONLY].skips_by_reason
+
+    assert reasons.get("terminal_failure_class", 0) > 0
+    # The value test is exactly what this strategy gives up.
+    assert reasons.get("negative_net_value", 0) == 0
+
+
+async def test_the_constrained_budget_actually_binds(conn, comparison_holder):
+    """Without this, the Whittle index only ever decides sign.
+
+    An index that ranks is only doing work a threshold could not when the
+    budget forces it to choose between two records it wants. Every headline
+    number before this strategy existed was produced with no ceiling at all.
+    """
+    result = await get_comparison(conn, comparison_holder)
+    constrained = result[STRATEGY_FORBEAR_CONSTRAINED]
+
+    budget = int(round(HarnessConfig().constrained_budget_ratio * RECORDS))
+    assert constrained.attempts_consumed <= budget
+    assert constrained.skips_by_reason.get("batch_budget_exhausted", 0) > 0
+
+
+# --- many seeds ------------------------------------------------------------
+
+
+async def test_run_multi_seed_reports_a_spread(conn):
+    """One seed is one draw. The spread is what makes the number reportable."""
+    seeds = [1, 2, 3]
+    summaries, qini = await run_multi_seed(conn, seeds, n_records=60)
+
+    assert set(summaries) == set(STRATEGIES)
+    net = summaries[STRATEGY_FORBEAR]["net_value"]
+    assert len(net.values) == len(seeds)
+    assert net.minimum <= net.mean <= net.maximum
+    assert net.stdev >= 0
+
+    print("\n" + format_multi_seed(summaries, qini, seeds))
+
+
+async def test_run_multi_seed_refuses_a_single_seed(conn):
+    with pytest.raises(ValueError, match="two seeds"):
+        await run_multi_seed(conn, [42], n_records=40)

@@ -21,8 +21,24 @@ MAX_ATTEMPTS = 4
 # Minimum gap between the last executed attempt and the next one.
 ATTEMPT_COOLDOWN = timedelta(hours=24)
 
-# How long a pre-debit notification remains valid as authorisation for a debit.
-NOTIFICATION_VALIDITY = timedelta(hours=24)
+# Pre-debit notification timing. Two bounds, and they point in opposite
+# directions, which is the whole reason this was wrong once already.
+#
+# NPCI's e-mandate rules require the customer to be told BEFORE the debit, with
+# at least a day to see it and act on it. So a notification authorises a debit
+# only once it has aged past the lead time: one sent ten seconds ago authorises
+# nothing, however recent and however genuine.
+#
+# The comparison against this is strict. "At least 24 hours' notice" is not
+# satisfied by a notification sent at exactly the debit instant minus 24 hours,
+# and a boundary that admits the exact instant is one an auditor gets to argue
+# about.
+NOTIFICATION_MIN_LEAD = timedelta(hours=24)
+
+# The other end. Consent goes stale: a notification from last month must not
+# authorise a debit today, or the lead-time rule would be satisfied forever by
+# a single notification sent once.
+NOTIFICATION_MAX_AGE = timedelta(days=7)
 
 # Fixed UTC+05:30. Deliberately not zoneinfo("Asia/Kolkata"): a tz database
 # update could silently move these boundaries. India does not observe DST, but

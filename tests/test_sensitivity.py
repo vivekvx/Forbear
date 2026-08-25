@@ -21,7 +21,11 @@ import csv
 
 import pytest
 
-from forbear.services.harness import STRATEGY_FORBEAR, STRATEGY_UNCONSTRAINED
+from forbear.services.harness import (
+    STRATEGIES,
+    STRATEGY_FORBEAR,
+    STRATEGY_UNCONSTRAINED,
+)
 from forbear.services.sensitivity import (
     CSV_COLUMNS,
     DEFAULT_CHURN_RATES,
@@ -176,12 +180,8 @@ async def test_the_sweep_writes_a_readable_csv(conn, sweep_holder, tmp_path):
         rows = list(csv.DictReader(handle))
 
     assert list(rows[0]) == list(CSV_COLUMNS)
-    assert len(rows) == len(RATES) * 3
-    assert {row["strategy"] for row in rows} == {
-        "fixed_schedule",
-        "forbear",
-        "unconstrained",
-    }
+    assert len(rows) == len(RATES) * len(STRATEGIES)
+    assert {row["strategy"] for row in rows} == set(STRATEGIES)
     assert {float(row["churn_rate"]) for row in rows} == set(RATES)
 
 

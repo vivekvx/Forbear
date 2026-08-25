@@ -204,11 +204,37 @@ def test_the_segment_ordering_is_the_expected_one(dataset):
 # --- e. Qini ---------------------------------------------------------------
 
 
-def test_qini_score_beats_random_ranking(dataset):
-    score = qini_score(dataset.cate, dataset.treatment, dataset.outcome)
+def test_held_out_qini_beats_random_ranking(dataset):
+    """The honest number: ranking quality on records the model never saw.
 
-    print(f"\nQini coefficient: {score:.4f}")
-    assert score > 0
+    This replaced an in-sample assertion. That one passed comfortably and
+    measured the wrong thing - gradient boosting memorises, so scoring on the
+    fitted rows reports discrimination the model does not have. The in-sample
+    figure is printed beside the held-out one to keep the gap in view rather
+    than quietly dropping it.
+    """
+    evaluation = UpliftModel(seed=SEED).fit_and_evaluate(
+        dataset.X, dataset.treatment, dataset.outcome
+    )
+
+    print(
+        f"\nQini in-sample {evaluation.in_sample_qini:.4f}  "
+        f"held-out {evaluation.held_out_qini:.4f}  "
+        f"(in-sample overstates by {evaluation.overstatement:.1f}x, "
+        f"train {evaluation.n_train}, test {evaluation.n_test})"
+    )
+
+    assert evaluation.held_out_qini > 0
+
+
+def test_the_in_sample_score_overstates_the_held_out_one(dataset):
+    """Records the defect that motivated the split, so it cannot come back
+    unnoticed: if these two ever converge, the evaluation changed."""
+    evaluation = UpliftModel(seed=SEED).fit_and_evaluate(
+        dataset.X, dataset.treatment, dataset.outcome
+    )
+
+    assert evaluation.in_sample_qini > evaluation.held_out_qini
 
 
 def test_a_shuffled_ranking_scores_worse_than_the_model(dataset):

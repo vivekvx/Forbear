@@ -87,7 +87,7 @@ async def build_valid_scenario(conn, now: datetime, *, mandate_status="active"):
         conn,
         ids["customer_id"],
         ids["subscription_id"],
-        now - timedelta(hours=1),
+        now - timedelta(hours=25),
     )
     return ids
 
@@ -193,7 +193,7 @@ async def test_blocked_when_cooldown_has_not_elapsed(conn, monkeypatch):
         executed_at=now - timedelta(hours=1),
     )
     await insert_notification(
-        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=1)
+        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=25)
     )
 
     verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
@@ -207,7 +207,7 @@ async def test_cooldown_passes_with_no_prior_attempt(conn, monkeypatch):
     now = freeze(monkeypatch, at_ist(DEFAULT_HOUR_IST))
     ids = await insert_scenario(conn)
     await insert_notification(
-        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=1)
+        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(hours=25)
     )
 
     verdict = await guard_check(
@@ -276,7 +276,8 @@ async def test_blocked_when_no_notification_exists(conn, monkeypatch):
     assert verdict.details["reason"] == "no_notification_found"
 
 
-async def test_blocked_when_notification_is_older_than_24h(conn, monkeypatch):
+async def test_notification_just_past_the_lead_time_authorises(conn, monkeypatch):
+    """24h and a minute. The customer has had their day's notice."""
     now = freeze(monkeypatch, at_ist(DEFAULT_HOUR_IST))
     ids = await insert_scenario(conn)
     await insert_notification(
@@ -290,13 +291,15 @@ async def test_blocked_when_notification_is_older_than_24h(conn, monkeypatch):
         conn, ids["record_id"], charge(ids["record_id"], attempt_number=1)
     )
 
-    assert verdict.allowed is False
-    assert verdict.rule_name == RULE_NOTIFICATION
-    assert verdict.details["reason"] == "notification_expired"
+    assert verdict.allowed is True
 
 
-async def test_notification_exactly_24h_old_still_counts(conn, monkeypatch):
-    """The rule is sent_at >= now - 24h, so the boundary is inclusive."""
+async def test_notification_exactly_24h_old_is_refused(conn, monkeypatch):
+    """"At least 24 hours" is strict: the boundary instant is not enough.
+
+    A rule that admits the exact instant is a rule an auditor gets to argue
+    about, and the cost of being strict here is one minute.
+    """
     now = freeze(monkeypatch, at_ist(DEFAULT_HOUR_IST))
     ids = await insert_scenario(conn)
     await insert_notification(
@@ -307,7 +310,44 @@ async def test_notification_exactly_24h_old_still_counts(conn, monkeypatch):
         conn, ids["record_id"], charge(ids["record_id"], attempt_number=1)
     )
 
-    assert verdict.allowed is True
+    assert verdict.allowed is False
+    assert verdict.rule_name == RULE_NOTIFICATION
+    assert verdict.details["reason"] == "insufficient_notification_lead"
+
+
+async def test_blocked_when_notification_has_not_aged_enough(conn, monkeypatch):
+    """The defect this rule was written to fix: a debit moments after telling
+    the customer it is coming."""
+    now = freeze(monkeypatch, at_ist(DEFAULT_HOUR_IST))
+    ids = await insert_scenario(conn)
+    await insert_notification(
+        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(seconds=10)
+    )
+
+    verdict = await guard_check(
+        conn, ids["record_id"], charge(ids["record_id"], attempt_number=1)
+    )
+
+    assert verdict.allowed is False
+    assert verdict.rule_name == RULE_NOTIFICATION
+    assert verdict.details["reason"] == "insufficient_notification_lead"
+
+
+async def test_blocked_when_notification_is_stale(conn, monkeypatch):
+    """Consent expires. Eight days is not standing authorisation."""
+    now = freeze(monkeypatch, at_ist(DEFAULT_HOUR_IST))
+    ids = await insert_scenario(conn)
+    await insert_notification(
+        conn, ids["customer_id"], ids["subscription_id"], now - timedelta(days=8)
+    )
+
+    verdict = await guard_check(
+        conn, ids["record_id"], charge(ids["record_id"], attempt_number=1)
+    )
+
+    assert verdict.allowed is False
+    assert verdict.rule_name == RULE_NOTIFICATION
+    assert verdict.details["reason"] == "notification_expired"
 
 
 async def test_notification_for_another_subscription_does_not_authorise(
@@ -321,7 +361,7 @@ async def test_notification_for_another_subscription_does_not_authorise(
         conn,
         ids["customer_id"],
         other["subscription_id"],
-        now - timedelta(hours=1),
+        now - timedelta(hours=25),
     )
 
     verdict = await guard_check(
@@ -340,7 +380,7 @@ async def test_dunning_contact_is_not_a_notification(conn, monkeypatch):
         conn,
         ids["customer_id"],
         ids["subscription_id"],
-        now - timedelta(hours=1),
+        now - timedelta(hours=25),
         purpose="dunning",
         channel="email",
     )
