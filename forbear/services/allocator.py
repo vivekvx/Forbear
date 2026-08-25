@@ -161,7 +161,8 @@ async def _load_facts(conn, record_ids: list[int]) -> dict[int, _RecordFacts]:
                s.mandate_status,
                COALESCE(counted.attempts, 0) AS attempts_so_far,
                notified.last_notification_at
-        FROM at_risk_records r
+        FROM unnest($1::bigint[]) AS wanted(record_id)
+        JOIN at_risk_records r ON r.id = wanted.record_id
         JOIN subscriptions s ON s.id = r.subscription_id
         LEFT JOIN LATERAL (
             SELECT count(*) AS attempts
@@ -174,7 +175,6 @@ async def _load_facts(conn, record_ids: list[int]) -> dict[int, _RecordFacts]:
             WHERE c.subscription_id = r.subscription_id
               AND c.purpose = 'pre_debit_notification'
         ) notified ON TRUE
-        WHERE r.id = ANY($1::bigint[])
         """,
         record_ids,
     )
@@ -209,13 +209,20 @@ async def _success_patterns(
     inferred from behaviour rather than declared. A customer with no successful
     debit has neither, and gets scheduled on earliness alone.
     """
+    # Joined against unnest rather than filtered with `= ANY($1)`. With ten
+    # thousand ids in the array and no statistics on a freshly loaded table,
+    # the planner reads ANY() as a filter it can satisfy by nested loop, and
+    # the query stops finishing: a cycle that took seconds at five hundred
+    # records ran for over an hour at ten thousand. As a join, the ids are a
+    # relation with a known cardinality and the plan is a hash join at any
+    # size.
     rows = await conn.fetch(
         """
         SELECT r.customer_id, a.executed_at
-        FROM attempts a
-        JOIN at_risk_records r ON r.id = a.at_risk_record_id
-        WHERE r.customer_id = ANY($1::bigint[])
-          AND a.outcome = 'success'
+        FROM unnest($1::bigint[]) AS wanted(customer_id)
+        JOIN at_risk_records r ON r.customer_id = wanted.customer_id
+        JOIN attempts a ON a.at_risk_record_id = r.id
+        WHERE a.outcome = 'success'
           AND a.executed_at IS NOT NULL
         """,
         customer_ids,
