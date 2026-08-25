@@ -198,8 +198,16 @@ def _mandate_statuses(rng: np.random.RandomState, n: int) -> list[MandateStatus]
     return [MandateStatus(code) for code in codes]
 
 
-def generate_profiles(n: int, seed: int) -> list[CustomerProfile]:
+def generate_profiles(
+    n: int, seed: int, contact_sensitivity: Optional[float] = None
+) -> list[CustomerProfile]:
     """n customers with a fixed segment mix and randomised everything else.
+
+    contact_sensitivity pins every do_not_disturb to the same churn-per-contact
+    probability instead of drawing one. Only the sensitivity sweep uses it: to
+    ask where the allocator's decisions flip, the churn coefficient has to be
+    the one thing moving, and a distribution of tempers would blur exactly the
+    boundary the sweep exists to locate.
 
     Reproducible by construction: one explicitly seeded RandomState, no use of
     the global numpy random state, and no dependence on set iteration order.
@@ -208,6 +216,10 @@ def generate_profiles(n: int, seed: int) -> list[CustomerProfile]:
     """
     if n < 0:
         raise ValueError(f"n must be non-negative, got {n}")
+    if contact_sensitivity is not None and not 0.0 <= contact_sensitivity <= 1.0:
+        raise ValueError(
+            f"contact_sensitivity is a probability, got {contact_sensitivity}"
+        )
 
     rng = np.random.RandomState(seed)
 
@@ -239,8 +251,13 @@ def generate_profiles(n: int, seed: int) -> list[CustomerProfile]:
         60,
     )
     # Only do_not_disturbs have a churn response to contact; drawn per customer
-    # so the segment has a spread of tempers rather than one global rate.
-    sensitivities = rng.uniform(0.25, 0.75, size=n)
+    # so the segment has a spread of tempers rather than one global rate. The
+    # draw happens either way, so pinning the value does not shift the random
+    # stream and a swept run stays comparable to an unswept one.
+    drawn = rng.uniform(0.25, 0.75, size=n)
+    sensitivities = (
+        drawn if contact_sensitivity is None else np.full(n, contact_sensitivity)
+    )
 
     return [
         CustomerProfile(

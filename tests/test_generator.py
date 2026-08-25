@@ -477,6 +477,38 @@ def _project_imports(path: pathlib.Path) -> set[str]:
     return {name for name in imported if name.startswith("forbear")}
 
 
+# The measurement harness generates the book it measures, so it holds the
+# answer key by definition - it is a simulation driver, not a decision path.
+# Naming it here keeps the exception explicit and countable: if a second entry
+# ever appears, someone has to justify it in a diff.
+SIMULATION_MODULES = frozenset(
+    {
+        "forbear/services/harness.py",
+        # The demo stream endpoint generates the book it streams, which is why
+        # it can run without a production database behind it. It is a
+        # simulation surface that happens to be mounted on the API, and listing
+        # it here rather than letting it pass silently is the point: a route
+        # that fabricates customers should be visible in a diff.
+        "forbear/api/stream.py",
+    }
+)
+
+# The path a real decision travels: score, rank, plan, permit, execute. None of
+# it may reach the generator, whatever a simulation surface is allowed to do.
+DECISION_PATH = (
+    "forbear/scoring",
+    "forbear/core",
+    "forbear/api/webhooks.py",
+    "forbear/api/main.py",
+    "forbear/services/allocator.py",
+    "forbear/services/baseline.py",
+    "forbear/services/unconstrained_baseline.py",
+    "forbear/services/executor.py",
+    "forbear/services/classifier.py",
+    "forbear/services/ingestion.py",
+)
+
+
 def test_no_runtime_module_can_reach_the_ground_truth():
     """Structural enforcement, following test_guard's import check.
 
@@ -485,10 +517,16 @@ def test_no_runtime_module_can_reach_the_ground_truth():
     predicting, and every number the system reported afterwards would be
     circular. Keeping the dependency one-way is the only check that does not
     rely on someone remembering.
+
+    The measurement harness is the one sanctioned exception: it generates the
+    book it measures, the way a test does. It is named rather than skipped, so
+    the exception cannot quietly grow.
     """
     offenders = {}
     for path in sorted((REPO_ROOT / "forbear").rglob("*.py")):
         if path.parent.name == "generator":
+            continue
+        if str(path.relative_to(REPO_ROOT)) in SIMULATION_MODULES:
             continue
         leaking = {
             name for name in _project_imports(path) if name.startswith("forbear.generator")
@@ -497,6 +535,30 @@ def test_no_runtime_module_can_reach_the_ground_truth():
             offenders[str(path.relative_to(REPO_ROOT))] = sorted(leaking)
 
     assert offenders == {}, f"runtime code importing the answer key: {offenders}"
+
+
+def test_the_decision_path_is_clean_even_of_sanctioned_exceptions():
+    """The narrower rule, stated separately so the exception above cannot creep.
+
+    Scoring, ranking, planning, permitting and executing are what a real
+    decision passes through. A simulation driver may hold the answer key; none
+    of these may, and no future entry in SIMULATION_MODULES can change that.
+    """
+    for target in DECISION_PATH:
+        location = REPO_ROOT / target
+        paths = (
+            sorted(location.rglob("*.py")) if location.is_dir() else [location]
+        )
+        for path in paths:
+            leaking = sorted(
+                name
+                for name in _project_imports(path)
+                if name.startswith("forbear.generator")
+            )
+            assert leaking == [], (
+                f"{path.relative_to(REPO_ROOT)} is on the decision path and "
+                f"imports the answer key: {leaking}"
+            )
 
 
 def test_the_generator_depends_on_runtime_code_and_not_the_reverse():
