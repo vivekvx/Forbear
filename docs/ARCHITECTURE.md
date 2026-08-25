@@ -240,3 +240,17 @@ The guard enforces, from `forbear/config/limits.py`:
 e-mandate circulars before any production use.** They were sourced
 secondarily during this build and may be outdated or incomplete; this
 codebase is not a substitute for checking the primary regulatory text.
+
+## References
+
+[2] Gutierrez & Gérardy, "A Unified Survey of Treatment Effect Heterogeneity
+    Modelling and Uplift Modelling," 2024.
+
+[3] Zhao & Harinen, "Bridging the Gap: Benchmarking 15 Uplift Modeling
+    Methods," 2023.
+
+[4] Mate et al., "Collapsing Bandits and Their Application to Public Health
+    Intervention," NeurIPS 2020.
+
+[6] Chen et al., "A Dynamic Framework for Causal User Profiling in Internet
+    Lending," 2023.
