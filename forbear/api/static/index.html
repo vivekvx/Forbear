@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Forbear · recovery decisioning</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #0a0a0a; color: #e4e4e7; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .rule { border-color: #1f1f23; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #27272a; }
+  ::-webkit-scrollbar-track { background: #0a0a0a; }
+  .row-enter { animation: slide .18s ease-out; }
+  @keyframes slide { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* Money arrives in paise. Every figure on screen is rupees, because nobody
+   reasons about a recovery book in paise. */
+const rupees = (paise) =>
+  "₹" + Math.round((paise || 0) / 100).toLocaleString("en-IN");
+
+const pct = (value) => ((value || 0) * 100).toFixed(1) + "%";
+
+const GREEN = "#22c55e";
+const RED = "#ef4444";
+const AMBER = "#f59e0b";
+const DIM = "#71717a";
+
+const cateColour = (cate) => (cate > 0.005 ? GREEN : cate < -0.005 ? RED : DIM);
+const signed = (n) => (n >= 0 ? "+" : "−") + Math.abs(n).toFixed(3);
+
+const SKIP_LABEL = {
+  negative_net_value: "would destroy more value than it recovers",
+  terminal_failure_class: "no attempt can recover this failure class",
+  mandate_state_invalid: "mandate cannot authorise a debit",
+  attempt_budget_exhausted: "attempt cap already consumed",
+  batch_budget_exhausted: "cycle budget spent on higher-value records",
+  unclassified_failure_code: "no classifier mapping; on the exception list",
+  no_legal_slot: "no legal execution window inside the horizon",
+};
+
+const slotLabel = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" }) +
+    " " + d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+};
+
+/* ---------------------------------------------------------------- Zone 1 */
+/* Two counters, same size, same weight, same position value. The symmetry is
+   the argument: money recovered and money not spent chasing are the same kind
+   of number, and a layout that made one bigger would be making the case for
+   recovery rate all over again. */
+function Counter({ label, value, sub, colour }) {
+  return (
+    <div className="flex-1 px-6 py-5">
+      <div className="text-xs uppercase tracking-[0.18em]" style={{ color: DIM }}>{label}</div>
+      <div className="mono text-5xl font-bold mt-2 tabular-nums" style={{ color: colour }}>{value}</div>
+      <div className="mono text-sm mt-1" style={{ color: DIM }}>{sub}</div>
+    </div>
+  );
+}
+
+function Counters({ c }) {
+  const recovered = c.recovered_so_far || 0;
+  const atRisk = c.total_at_risk || 0;
+  const share = atRisk ? recovered / atRisk : 0;
+  return (
+    <div>
+      <div className="flex border-b rule">
+        <Counter
+          label="Recovered"
+          value={rupees(recovered)}
+          sub={`of ${rupees(atRisk)} at risk · ${pct(share)}`}
+          colour={GREEN}
+        />
+        <div className="w-px bg-[#1f1f23]" />
+        <Counter
+          label="Protected"
+          value={rupees(c.ltv_protected)}
+          sub={`${c.skipped_count || 0} records deliberately not chased`}
+          colour={AMBER}
+        />
+      </div>
+      <div className="flex gap-8 px-6 py-2 border-b rule mono text-xs" style={{ color: DIM }}>
+        <span>attempts <span className="text-zinc-300">{c.attempts_consumed || 0}</span></span>
+        <span>recovered/attempt <span className="text-zinc-300">{(c.recovered_per_attempt || 0).toFixed(3)}</span></span>
+        <span>recovery rate <span className="text-zinc-300">{pct(c.recovery_rate)}</span></span>
+        <span>churned <span style={{ color: c.churned_count ? RED : DIM }}>{c.churned_count || 0}</span></span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Zone 3 */
+function Drawer({ d }) {
+  const rules = (d.guard_verdict && d.guard_verdict.details && d.guard_verdict.details.checks_passed) || [];
+  const skip = d.skip_details || {};
+  return (
+    <div className="px-6 py-4 mono text-xs bg-[#0d0d10] border-t rule" style={{ color: "#a1a1aa" }}>
+      <div className="grid grid-cols-2 gap-x-10 gap-y-4">
+        <div>
+          <div className="uppercase tracking-wider mb-1" style={{ color: DIM }}>uplift</div>
+          <div>CATE <span style={{ color: cateColour(d.cate) }}>{signed(d.cate)}</span></div>
+          <div>recovery probability {(d.recovery_probability || 0).toFixed(4)}</div>
+          <div>whittle index <span style={{ color: d.whittle_index >= 0 ? GREEN : RED }}>{d.whittle_index}</span></div>
+          {d.segment && (
+            <div style={{ color: DIM }}>
+              true segment {d.segment}
+              <span className="text-[10px]"> (demo only — never scored)</span>
+            </div>
+          )}
+        </div>
+        <div>
+          <div className="uppercase tracking-wider mb-1" style={{ color: DIM }}>guard</div>
+          {d.guard_verdict ? (
+            <div>
+              <div style={{ color: d.guard_verdict.allowed ? GREEN : RED }}>
+                {d.guard_verdict.allowed ? "ALLOWED" : "BLOCKED · " + d.guard_verdict.rule_name}
+              </div>
+              {rules.map((r) => <div key={r}>✓ {r}</div>)}
+            </div>
+          ) : (
+            <div style={{ color: DIM }}>not proposed — the guard was never asked</div>
+          )}
+        </div>
+        {d.action === "skipped" && (
+          <div className="col-span-2">
+            <div className="uppercase tracking-wider mb-1" style={{ color: DIM }}>why this was refused</div>
+            <div>{skip.detail || SKIP_LABEL[d.skip_reason] || d.skip_reason}</div>
+            <div className="mt-1 flex gap-6 flex-wrap">
+              {skip.cate !== undefined && <span>cate {Number(skip.cate).toFixed(4)}</span>}
+              {skip.amount !== undefined && <span>invoice {rupees(skip.amount)}</span>}
+              {skip.ltv_at_risk !== undefined && <span>ltv at risk {rupees(skip.ltv_at_risk)}</span>}
+              {skip.whittle_index !== undefined && <span>index {Number(skip.whittle_index).toFixed(3)}</span>}
+              {skip.threshold !== undefined && <span>threshold {skip.threshold}</span>}
+              {skip.attempts_so_far !== undefined && <span>attempts {skip.attempts_so_far}/{skip.max_attempts}</span>}
+            </div>
+          </div>
+        )}
+        {d.audit_hash && (
+          <div className="col-span-2">
+            <div className="uppercase tracking-wider mb-1" style={{ color: DIM }}>audit chain head</div>
+            <div className="break-all" style={{ color: "#52525b" }}>{d.audit_hash}</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Zone 2 */
+/* Skipped rows stay in the stream. They are outputs, not errors: a refusal the
+   operator cannot see is a refusal nobody can challenge. */
+function Row({ d }) {
+  const [open, setOpen] = useState(false);
+  const skipped = d.action === "skipped";
+  const blocked = d.outcome === "blocked";
+  const recovered = d.outcome === "recovered";
+
+  const marker = skipped ? AMBER : blocked ? RED : recovered ? GREEN : "#3f3f46";
+  const verb = skipped
+    ? "skipped"
+    : blocked
+    ? "blocked · " + ((d.guard_verdict && d.guard_verdict.rule_name) || "guard")
+    : recovered
+    ? "retry " + slotLabel(d.scheduled_at) + " · RECOVERED"
+    : "retry " + slotLabel(d.scheduled_at) + " · ALLOWED";
+
+  const tail = skipped
+    ? d.skip_reason === "negative_net_value"
+      ? "would risk " + rupees(d.ltv_at_risk) + " LTV"
+      : SKIP_LABEL[d.skip_reason] || d.skip_reason
+    : "";
+
+  return (
+    <div className="border-b rule row-enter">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full text-left px-6 py-2 hover:bg-[#131316] flex items-baseline gap-3 mono text-[13px]"
+      >
+        <span style={{ color: marker }}>{open ? "▾" : "▸"}</span>
+        <span className="w-20 text-right tabular-nums text-zinc-200">{rupees(d.amount)}</span>
+        <span className="w-52 truncate" style={{ color: "#8b8b93" }}>{d.failure_code}</span>
+        <span className="w-24 tabular-nums" style={{ color: cateColour(d.cate) }}>CATE {signed(d.cate)}</span>
+        <span className="flex-1 truncate" style={{ color: skipped ? AMBER : "#c4c4cc" }}>{verb}</span>
+        <span className="truncate" style={{ color: DIM }}>{tail}</span>
+      </button>
+      {open && <Drawer d={d} />}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Zone 4 */
+const TABLE_ROWS = [
+  ["amount at risk", (s) => rupees(s.amount_at_risk)],
+  ["recovered", (s) => rupees(s.amount_recovered)],
+  ["recovery rate", (s) => pct(s.recovery_rate)],
+  ["attempts", (s) => (s.attempts_consumed || 0).toLocaleString()],
+  ["recovered per attempt", (s) => (s.recovered_per_attempt || 0).toFixed(3)],
+  ["skipped", (s) => (s.records_skipped || 0).toLocaleString()],
+  ["churned", (s) => (s.churned_count || 0).toLocaleString()],
+  ["ltv lost to churn", (s) => rupees(s.ltv_lost_to_churn)],
+];
+
+const ORDER = ["fixed_schedule", "forbear", "unconstrained"];
+
+function Comparison({ summary }) {
+  const s = summary.strategies;
+  return (
+    <div className="border-t rule">
+      <div className="px-6 py-3 text-xs uppercase tracking-[0.18em]" style={{ color: DIM }}>
+        same book, three policies · seed {summary.seed} · {summary.n_records} records
+      </div>
+      <table className="w-full mono text-[13px]">
+        <thead>
+          <tr style={{ color: DIM }}>
+            <th className="text-left font-normal px-6 py-2"></th>
+            {ORDER.map((k) => (
+              <th key={k} className={"text-right font-normal px-6 py-2 " + (k === "forbear" ? "text-zinc-200" : "")}>{k}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {TABLE_ROWS.map(([label, render]) => (
+            <tr key={label} className="border-t rule">
+              <td className="px-6 py-1.5" style={{ color: DIM }}>{label}</td>
+              {ORDER.map((k) => (
+                <td key={k} className="text-right px-6 py-1.5 tabular-nums text-zinc-300">
+                  {s[k] ? render(s[k]) : "—"}
+                </td>
+              ))}
+            </tr>
+          ))}
+          <tr className="border-t-2" style={{ borderColor: "#3f3f46", background: "#101014" }}>
+            <td className="px-6 py-3 font-semibold uppercase tracking-wider text-xs">net value</td>
+            {ORDER.map((k) => {
+              const v = (s[k] && s[k].net_value) || 0;
+              return (
+                <td key={k} className="text-right px-6 py-3 tabular-nums text-lg font-bold"
+                    style={{ color: v > 0 ? GREEN : RED }}>
+                  {v > 0 ? "+" : "−"}{rupees(Math.abs(v)).slice(1)}
+                </td>
+              );
+            })}
+          </tr>
+        </tbody>
+      </table>
+      <div className="px-6 py-3 text-xs" style={{ color: DIM }}>
+        net value = amount recovered − lifetime value lost to churn caused by contact.
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- app */
+function App() {
+  const [rows, setRows] = useState([]);
+  const [counters, setCounters] = useState({});
+  const [summary, setSummary] = useState(null);
+  const [status, setStatus] = useState("idle");
+  const [showAll, setShowAll] = useState(false);
+  const [seed, setSeed] = useState(42);
+  const [n, setN] = useState(200);
+  const source = useRef(null);
+  const retry = useRef(null);
+  const finished = useRef(false);
+
+  const stop = useCallback(() => {
+    if (source.current) { source.current.close(); source.current = null; }
+    if (retry.current) { clearTimeout(retry.current); retry.current = null; }
+  }, []);
+
+  const run = useCallback(() => {
+    stop();
+    finished.current = false;
+    setRows([]); setCounters({}); setSummary(null); setStatus("running");
+
+    const es = new EventSource(`/stream/run?seed=${seed}&n=${n}&demo_mode=true`);
+    source.current = es;
+
+    es.addEventListener("start", (e) => setCounters(JSON.parse(e.data)));
+    es.addEventListener("decision", (e) => {
+      const d = JSON.parse(e.data);
+      setRows((prev) => [d, ...prev]);   // newest at the top
+    });
+    es.addEventListener("counter", (e) => setCounters(JSON.parse(e.data)));
+    es.addEventListener("summary", (e) => {
+      finished.current = true;
+      setSummary(JSON.parse(e.data));
+      setStatus("done");
+      stop();
+    });
+    es.addEventListener("error", (e) => {
+      if (e.data) { finished.current = true; setStatus("error"); stop(); }
+    });
+
+    /* Auto-reconnect. EventSource retries on its own, but a stream that has
+       finished looks identical to one that dropped - so the retry is explicit
+       and only fires while a run is still in flight. */
+    es.onerror = () => {
+      if (finished.current) return;
+      setStatus("reconnecting");
+      es.close();
+      retry.current = setTimeout(run, 1000);
+    };
+  }, [seed, n, stop]);
+
+  useEffect(() => stop, [stop]);
+
+  const visible = showAll ? rows : rows.slice(0, 50);
+  const skips = rows.filter((r) => r.action === "skipped").length;
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      {/* flex-wrap, and the strapline goes before the controls do: at a narrow
+          viewport the run button is the thing an operator needs, and a header
+          that pushes it off the edge is a screen nobody can drive. */}
+      <header className="flex flex-wrap items-baseline gap-x-4 gap-y-2 px-6 py-3 border-b rule">
+        <span className="mono font-bold tracking-tight">FORBEAR</span>
+        <span className="text-xs hidden xl:inline" style={{ color: DIM }}>recovery decisioning · what the system is deciding, and why</span>
+        <span className="flex-1 min-w-0" />
+        <label className="mono text-xs" style={{ color: DIM }}>seed
+          <input type="number" value={seed} onChange={(e) => setSeed(+e.target.value)}
+            className="mono ml-2 w-20 bg-[#131316] border rule px-2 py-1 text-zinc-200" style={{ borderRadius: 4 }} />
+        </label>
+        <label className="mono text-xs" style={{ color: DIM }}>n
+          <input type="number" value={n} onChange={(e) => setN(+e.target.value)}
+            className="mono ml-2 w-20 bg-[#131316] border rule px-2 py-1 text-zinc-200" style={{ borderRadius: 4 }} />
+        </label>
+        <button onClick={run} disabled={status === "running"}
+          className="mono text-xs px-4 py-1.5 border disabled:opacity-40"
+          style={{ borderRadius: 4, borderColor: "#3f3f46", background: "#18181b" }}>
+          {status === "running" ? "running…" : "run batch"}
+        </button>
+        <span className="mono text-xs" style={{ color: status === "error" ? RED : DIM }}>{status}</span>
+      </header>
+
+      <Counters c={counters} />
+
+      <div className="flex items-center gap-4 px-6 py-2 text-xs" style={{ color: DIM }}>
+        <span className="uppercase tracking-[0.18em]">decision stream</span>
+        <span className="mono">{rows.length} decisions · {skips} refusals</span>
+        <span className="flex-1" />
+        {rows.length > 50 && (
+          <button onClick={() => setShowAll(!showAll)} className="mono underline">
+            {showAll ? "show latest 50" : `show all ${rows.length}`}
+          </button>
+        )}
+      </div>
+
+      <main className="flex-1 overflow-y-auto border-t rule">
+        {rows.length === 0 && (
+          <div className="px-6 py-16 text-center text-sm" style={{ color: DIM }}>
+            {status === "running" ? "scoring the book…" : "press run batch"}
+          </div>
+        )}
+        {visible.map((d) => <Row key={d.record_id} d={d} />)}
+      </main>
+
+      {summary && <Comparison summary={summary} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
