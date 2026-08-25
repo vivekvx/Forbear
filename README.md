@@ -27,46 +27,56 @@ Mean ± σ across **10 seeds** at n=500. One seed is one draw of a synthetic
 world, and two of the first twelve tried came out net-negative — so the spread
 is reported rather than a single favourable run.
 
-| Metric (mean ± σ) | fixed_schedule | forbear | forbear_constrained | classifier_only | unconstrained |
-|---|---|---|---|---|---|
-| ₹ recovered | 78,786 ± 8,483 | 70,333 ± 11,121 | 49,536 ± 6,499 | 125,687 ± 10,467 | 183,702 ± 8,813 |
-| Recovery rate | 30.8% ± 1.4% | 30.5% ± 3.1% | 19.9% ± 1.3% | 44.5% ± 2.4% | 62.7% ± 1.8% |
-| Attempts consumed | 1,198 ± 21 | 250 ± 23 | 150 ± 0 | 388 ± 9 | 1,328 ± 26 |
-| ₹ recovered/attempt | 0.129 ± 0.006 | 0.609 ± 0.036 | 0.663 ± 0.042 | 0.574 ± 0.022 | 0.236 ± 0.005 |
-| Customers churned | 35 ± 5 | 5 ± 2 | 1 ± 1 | 30 ± 5 | 30 ± 5 |
-| LTV lost to churn | 429,781 ± 87,762 | 39,302 ± 29,196 | 4,553 ± 6,310 | 381,478 ± 75,712 | 381,478 ± 75,712 |
-| **Net value** | **−350,995 ± 83,849** | **+31,030 ± 25,542** | **+44,983 ± 10,455** | **−255,790 ± 73,128** | **−197,776 ± 75,157** |
-| Net value positive in | 0/10 seeds | 8/10 | **10/10** | 0/10 | 0/10 |
+| Metric | Fixed Schedule | Forbear (constrained) | Forbear (unconstrained budget) | Classifier Only |
+|---|---|---|---|---|
+| ₹ recovered | 78,786 ± 8,483 | 49,536 ± 6,499 | 70,333 ± 11,121 | 125,687 ± 10,467 |
+| Recovery rate | 30.8% ± 1.4% | 19.9% ± 1.3% | 30.5% ± 3.1% | 44.5% ± 2.4% |
+| Attempts consumed | 1,198 ± 21 | 150 ± 0 | 250 ± 23 | 388 ± 9 |
+| ₹ recovered/attempt | 0.129 ± 0.006 | 0.663 ± 0.042 | 0.609 ± 0.036 | 0.574 ± 0.022 |
+| Customers churned | 35 ± 5 | 1 ± 1 | 5 ± 2 | 30 ± 5 |
+| LTV lost to churn | 429,781 ± 87,762 | 4,553 ± 6,310 | 39,302 ± 29,196 | 381,478 ± 75,712 |
+| **Net value** | **−350,995 ± 83,849** | **+44,983 ± 10,455** | **+31,030 ± 25,542** | **−255,790 ± 73,128** |
+| Net value positive in | 0/10 seeds | **10/10 seeds** | 8/10 seeds | 0/10 seeds |
 
-Forbear recovers slightly *less* money than the platform's fixed schedule and
-is worth ~380,000 rupees more, because it churns 5 customers instead of 35.
-Recovery rate is the wrong objective; that gap is the whole argument.
+**Under a binding budget, Forbear is net-positive in every seed tested. The
+budget ceiling stops the allocator spending on marginal records — the
+condition the Whittle index exists to price.**
 
-**`classifier_only` is the ablation** — the same allocator, guard and
-executor with the uplift model's value threshold removed. It recovers the most
-money of any selective policy and loses 255,790, because without the model it
-cannot tell a persuadable customer from one who cancels when chased. The
-difference between it and Forbear is what the model and the Whittle index are
-worth: about **287,000 rupees** on a 252,000-rupee book.
+The unconstrained-budget column stays because it is what the allocator does
+without a ceiling, and the gap between the two columns is the argument for
+having one: same policy, same model, a quarter of the variance and ~14,000
+more rupees once the constraint binds.
 
-**`forbear_constrained`** runs under a binding budget of 0.3 × n. It is the
-only policy positive in every seed, with a quarter of the variance — the
-attempt ceiling forces the ranking to do real work instead of merely deciding
-sign.
+**`classifier_only` is the ablation** — the same allocator, guard and executor
+with the uplift model's value threshold removed, so the model influences
+nothing it does. It recovers ₹125,687, more than either Forbear
+configuration, and is worth ₹300,773 less than the constrained one, because
+it churns 30 customers instead of 1. The classifier separates dead mandates
+from live ones. Only the uplift model separates persuadable customers from
+those who cancel when chased.
+
+A chase-everything upper bound was measured too (recovers ₹183,702, net
+−197,776); the full five-strategy tables are in
+[docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-results).
 
 Held-out Qini across the same 10 seeds: **0.0515 ± 0.0456**.
 
-<sub>Seed 42 alone, for reproducibility: recovered 70,104 · recovery rate 29.2% ·
-223 attempts · 0.655 per attempt · 2 churned · 23,976 LTV lost · net value
-**+46,128** · 277 records skipped. This single seed sits about 0.6σ above the
-mean and was the number previously headlined here.</sub>
+<sub>**Single-seed (seed=42) numbers for reproducibility.** Forbear
+(unconstrained budget): recovered 70,104 · recovery rate 29.2% · 223 attempts
+· 0.655 per attempt · 2 churned · 23,976 LTV lost · net value **+46,128** ·
+277 records skipped. Forbear (constrained): recovered 51,453 · 150 attempts ·
+0.647 per attempt · 1 churned · 11,988 LTV lost · net value **+39,465** · 350
+records skipped. Seed 42 sits about 0.6σ above the mean and was the number
+previously headlined here.</sub>
 
 ### At scale (n=10,000)
 
-Unconstrained Forbear is net-negative at this scale: **−129,440**, against
-fixed schedule's **−7,628,738** — 59x smaller a loss, not a win. Under a
-binding budget of 0.3 × n, the same policy clears zero at **+86,786**, on a
-quarter of the attempts.
+At n=10,000 with a binding budget, Forbear clears zero (**+86,786**). Without
+the budget it is net-negative (**−129,440**). The constrained configuration is
+the recommended default.
+
+Both beat the platform: the fixed schedule loses **−7,628,738** at this size,
+so even the unconstrained configuration is a 59x smaller loss — but a loss.
 
 The mechanism: skip share collapses from 55.4% at n=500 to 38.1% at n=10,000
 as CATE estimates calibrate and fewer records cross below zero. At n=500 the

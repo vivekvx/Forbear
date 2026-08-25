@@ -142,31 +142,30 @@ the in-sample figure claimed.
 
 ### The ablation: does the model earn its complexity?
 
-`classifier_only` is the control. It runs the same allocator, the same guard,
-the same executor, with one thing removed: the value threshold. The uplift
-estimate influences no decision it makes, so whatever separates it from
-`forbear` is what the model and the Whittle index are worth.
+**The ablation result: `classifier_only` recovers ₹117,981 — more than
+Forbear — and is worth ₹187,623 less, because it churns 27 customers instead
+of 2. The classifier separates dead mandates from live ones. Only the uplift
+model separates persuadable customers from those who cancel when chased.**
 
-**forbear +46,128 against classifier_only −141,495 — a difference of 187,623
-rupees on a 252,350-rupee book.**
+`classifier_only` is the control for the whole architecture. It runs the same
+allocator, the same guard and the same executor, with one thing removed: the
+value threshold. The uplift estimate influences no decision it makes, so
+whatever separates the two columns is what the model and the Whittle index are
+worth. Both policies skip the same terminal failure classes, because that part
+belongs to the classifier and the ablation keeps it.
 
-The mechanism is the whole thesis in one row. `classifier_only` recovers
-**more** money than Forbear — 117,981 against 70,104 — and is worth far less,
-because it churns 27 customers instead of 2. The classifier can tell a dead
-mandate from a live one, which is why both policies skip the same terminal
-failures. What it cannot do is tell a persuadable customer from one who
-cancels when chased; only the uplift model carries that, and it is the
-difference between a policy that clears zero and one that loses money faster
-than the platform default it replaces.
+**`forbear_constrained` is positive in 10/10 seeds with a quarter of the
+variance of the unconstrained configuration. The binding budget prevents the
+allocator from spending attempts on marginal records once calibrated CATEs
+stop skipping them. This is the condition the Whittle index exists to price,
+and it was absent from every number this project reported before the
+ablation.**
 
-`forbear_constrained` answers the other half. Every number this project
-reported before it existed was produced with **no batch ceiling at all**,
-which meant the Whittle index only ever decided sign — everything above the
-threshold got scheduled, so the ranking never had to choose between two
-records it wanted. Under a binding budget of 0.3 × n it holds up: 0.647
-recovered per attempt against the unconstrained policy's 0.655, on 150
-attempts instead of 223, and still comfortably net-positive. The index
-degrades gracefully when it actually has to allocate.
+Across 10 seeds at n=500: constrained +44,983 ± 10,455, positive in 10/10;
+unconstrained +31,030 ± 25,542, positive in 8/10. On the single seed tabled
+above it holds 0.647 recovered per attempt against the unconstrained policy's
+0.655, on 150 attempts instead of 223 — the index degrades gracefully when it
+actually has to allocate rather than merely filter.
 
 ### n=10,000, five strategies (seed 42, 181s)
 
@@ -228,6 +227,17 @@ model from trivially inferring segment from treatment-outcome pairs, but they
 do not remove the underlying circularity: the generator and the model are
 built from the same conceptual segmentation.
 
+**Ranking quality is modest, and was previously reported as several times
+better than it is.** In-sample Qini overstated discrimination by approximately
+**4.7x**. The held-out figure is **0.09** (0.0907 at n=500, 0.1155 at
+n=10,000) — still above the shuffled control (0.03), confirming real signal,
+but a fifth of what the 0.3749 in an earlier draft of this document claimed.
+Across 10 seeds the held-out score is 0.0515 ± 0.0456, and on the weakest seed
+it touches −0.005: on some draws the ranking is no better than random. The
+policy's value comes as much from the deterministic classifier and the budget
+ceiling as from the model's ordering, and the ablation in §4 is what separates
+those contributions.
+
 **Do-not-disturb detection accuracy is 51%, and more data does not fix it.**
 The system gets the sign right — negative CATE — but on individual records it
 is barely better than a coin flip at identifying which specific customers are
@@ -275,12 +285,17 @@ threshold, the system skips more, and churn stays at 0.4%. At n=10,000 the
 model is better calibrated, fewer records are refused, churn rises to 2.1%,
 and net value goes negative.
 
-**So the n=500 profit is partly a small-sample artefact** — noise was doing
-some of the skipping, and it happened to skip in a profitable direction. The
-policy is sound; the discrimination underneath it is too weak to carry the
-policy at volume. That is the same conclusion the held-out Qini of 0.0907
-reaches from the other direction, and the two agreeing is the reason to
-believe either.
+**So the n=500 profit is partly a small-sample artefact.** At small n, noisy
+CATE estimates push more records below zero, so the system skips more and
+churns less. At n=10,000, estimates calibrate, fewer cross zero, skip share
+collapses from 55% to 38%, and churn rises. The constrained configuration
+solves this by imposing an external ceiling: it does not rely on the estimates
+falling below a threshold to stop spending, so calibration cannot erode it.
+
+The policy is sound; the discrimination underneath it is too weak to carry the
+policy at volume without that ceiling. That is the same conclusion the
+held-out Qini of 0.0907 reaches from the other direction, and the two agreeing
+is the reason to believe either.
 
 The three `test_scale.py` assertions that encode these claims are marked
 `xfail(strict=True)` rather than retuned or deleted. They are the claims the
@@ -298,10 +313,14 @@ configuration (`max_locks_per_transaction=64`) that capped comparisons at
 roughly 1,700 records.
 
 Raising `max_locks_per_transaction` to **600** removed the ceiling: the full
-n=10,000 comparison now completes in **137 seconds**. `test_scale.py` still
-computes the limit from the live server settings and skips with the exact
-arithmetic if a machine cannot support the run, so the suite stays honest on
-a default configuration. Production never had this constraint — each decision
+n=10,000 comparison completes in **137 seconds** for three strategies, **181
+seconds** for five. `test_scale.py` still computes the limit from the live
+server settings and skips with the exact arithmetic if a machine cannot
+support the run, so the suite stays honest on a default configuration. Adding
+the fourth and fifth strategies raised the requirement to 5 × n locks, which
+puts the computed ceiling (9,600 records here) just under n=10,000 — so the
+scale tests skip again on this box even at 600, and the n=10,000 tables above
+were produced by running the comparison directly. Production never had this constraint — each decision
 commits and releases its lock immediately; it was a property of measuring a
 whole cycle atomically. Committing per chunk would remove the dependency on
 server configuration entirely and remains worth doing.
