@@ -20,11 +20,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from forbear.api import stream, webhooks
+from forbear.api import actions, stream, webhooks, worklist
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-FRONTEND_PATH = pathlib.Path(__file__).resolve().parent / "static" / "index.html"
+STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
+FRONTEND_PATH = STATIC_DIR / "index.html"
+WORKLIST_FRONTEND_PATH = STATIC_DIR / "worklist.html"
+WORKLIST_JSX_PATH = STATIC_DIR / "worklist.jsx"
 
 DSN = os.environ.get("FORBEAR_DSN", "postgres:///forbear")
 
@@ -57,6 +60,8 @@ def create_app() -> FastAPI:
 
     app.include_router(webhooks.router)
     app.include_router(stream.router)
+    app.include_router(worklist.router)
+    app.include_router(actions.router)
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -71,6 +76,17 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     async def index() -> FileResponse:
+        # The worklist is the default merchant view; the technical decision
+        # stream that used to live here moved to /advanced for the deep-dive
+        # demo, and its API route (/stream/run) is unchanged.
+        return FileResponse(WORKLIST_FRONTEND_PATH, media_type="text/html")
+
+    @app.get("/worklist.jsx")
+    async def worklist_jsx() -> FileResponse:
+        return FileResponse(WORKLIST_JSX_PATH, media_type="text/javascript")
+
+    @app.get("/advanced")
+    async def advanced() -> FileResponse:
         return FileResponse(FRONTEND_PATH, media_type="text/html")
 
     @app.get("/health")

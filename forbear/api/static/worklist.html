@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Forbear · today's worklist</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #faf9f7;
+    color: #23211d;
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    line-height: 1.5;
+  }
+  .page { max-width: 720px; margin: 0 auto; padding: 48px 24px 96px; }
+  .hero { margin-bottom: 40px; }
+  .hero-sentence {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin: 0 0 12px;
+    color: #1a1815;
+  }
+  .advanced-link {
+    font-size: 13px;
+    color: #9a9488;
+    text-decoration: none;
+  }
+  .advanced-link:hover { text-decoration: underline; }
+
+  .banner { max-width: 720px; margin: 80px auto; text-align: center; font-size: 16px; color: #6b6459; }
+  .error-banner { color: #b3453a; }
+
+  .section {
+    background: #fff;
+    border: 1px solid #eae6df;
+    border-radius: 14px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .section-header {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 18px 20px;
+    background: none;
+    border: none;
+    font-family: inherit;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    color: #23211d;
+  }
+  .section-count {
+    background: #f1efe9;
+    color: #6b6459;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 999px;
+  }
+  .chevron { margin-left: auto; color: #b8b2a4; }
+  .section-body { padding: 0 20px 20px; }
+  .empty { color: #9a9488; font-size: 14px; padding: 4px 0 8px; }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 16px 0;
+    border-top: 1px solid #f1efe9;
+  }
+  .row:first-child { border-top: none; }
+  .row-quiet { color: #6b6459; }
+  .row-main { display: flex; align-items: baseline; gap: 10px; min-width: 220px; flex: 1; }
+  .row-name { font-weight: 600; font-size: 15px; color: #23211d; }
+  .row-quiet .row-name { color: #6b6459; font-weight: 500; }
+  .row-amount { color: #6b6459; font-size: 14px; }
+  .row-reason { flex-basis: 100%; font-size: 14px; color: #857e6f; }
+  .row-action { margin-left: auto; }
+  .row-error { flex-basis: 100%; color: #b3453a; font-size: 13px; }
+
+  .primary-btn {
+    background: #b3572f;
+    color: #fff;
+    border: none;
+    border-radius: 9px;
+    padding: 9px 16px;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .primary-btn:disabled { opacity: 0.6; cursor: default; }
+  .primary-btn:hover:not(:disabled) { background: #9c4b28; }
+
+  .done-badge {
+    color: #4c7a4a;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .why { flex-basis: 100%; }
+  .why-toggle {
+    background: none;
+    border: none;
+    color: #9a9488;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+  }
+  .why-text { font-size: 13px; color: #857e6f; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="/worklist.jsx"></script>
+</body>
+</html>

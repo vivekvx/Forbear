@@ -86,6 +86,41 @@ CREATE INDEX at_risk_records_status_idx ON at_risk_records (status);
 CREATE INDEX at_risk_records_customer_idx ON at_risk_records (customer_id);
 
 
+-- Merchant worklist: the precomputed answer to "what do I do about this
+-- record today". Written once by the background decisioning job that runs
+-- after ingestion, read as-is by the worklist endpoint. The endpoint must
+-- never compute these values itself - that is the whole latency contract - so
+-- they live as columns rather than being derived at request time.
+ALTER TABLE at_risk_records
+    ADD COLUMN worklist_bucket TEXT
+        CHECK (worklist_bucket IN ('chase', 'wait', 'leave_alone')),
+    ADD COLUMN worklist_action TEXT,
+    ADD COLUMN worklist_reason TEXT,
+    ADD COLUMN worklist_scheduled_at TIMESTAMPTZ,
+    -- For a leave_alone record: the estimated rupee cost of chasing it anyway
+    -- (typically the LTV a contact would put at risk). Precomputed so an
+    -- override warning is also a read, not a recomputation.
+    ADD COLUMN worklist_cost_paise BIGINT,
+    ADD COLUMN worklist_decided_at TIMESTAMPTZ;
+
+
+-- Every merchant-triggered action, keyed for idempotency. A double-tap on the
+-- worklist must never send two payment links: the unique index on
+-- idempotency_key is what makes the second request a read of the first
+-- request's result rather than a second send.
+CREATE TABLE merchant_actions (
+    id                BIGSERIAL PRIMARY KEY,
+    idempotency_key   TEXT        NOT NULL UNIQUE,
+    at_risk_record_id BIGINT      NOT NULL REFERENCES at_risk_records (id),
+    action_type       TEXT        NOT NULL,
+    is_override       BOOLEAN     NOT NULL DEFAULT false,
+    result            JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX merchant_actions_record_idx ON merchant_actions (at_risk_record_id);
+
+
 CREATE TABLE attempts (
     id                BIGSERIAL PRIMARY KEY,
     at_risk_record_id BIGINT      NOT NULL REFERENCES at_risk_records (id),

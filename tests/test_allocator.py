@@ -598,3 +598,89 @@ def test_no_allocation_module_imports_the_generator():
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("forbear.generator")
+
+
+# --- preview mode ------------------------------------------------------------
+#
+# commit=False exists so a caller (the worklist's background decisioning) can
+# get the real plan without the real cycle's side effects. The guarantee that
+# makes that safe is that preview and commit never disagree: same scoring,
+# same ordering, same filters, same skip reasons. If they could diverge, the
+# worklist could show a merchant a decision the harness never actually made.
+
+
+async def test_preview_and_commit_plans_are_identical_for_scheduled_records(conn):
+    ids = await scenario(conn)
+
+    preview = await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=False)
+    committed = await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=True)
+
+    assert preview.skipped == committed.skipped == []
+    assert len(preview.scheduled) == len(committed.scheduled) == 1
+    assert preview.scheduled[0].record_id == committed.scheduled[0].record_id
+    assert preview.scheduled[0].action_kind == committed.scheduled[0].action_kind
+    assert preview.scheduled[0].scheduled_at == committed.scheduled[0].scheduled_at
+    assert preview.summary == committed.summary
+
+
+async def test_preview_and_commit_plans_are_identical_for_skipped_records(conn):
+    ids = await scenario(conn, mandate_status="revoked")
+
+    preview = await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=False)
+    committed = await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=True)
+
+    assert preview.scheduled == committed.scheduled == []
+    assert len(preview.skipped) == len(committed.skipped) == 1
+    assert preview.skipped[0] == committed.skipped[0]
+    assert preview.summary == committed.summary
+
+
+async def test_preview_mode_writes_no_audit_entry(conn):
+    ids = await scenario(conn)
+
+    await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=False)
+
+    assert await audit_actions(conn, ids["record_id"]) == []
+
+
+async def test_preview_mode_writes_no_audit_entry_for_a_skip(conn):
+    ids = await scenario(conn, mandate_status="revoked")
+
+    await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=False)
+
+    assert await audit_actions(conn, ids["record_id"]) == []
+
+
+async def test_preview_mode_causes_no_state_transition(conn):
+    ids = await scenario(conn)
+
+    await allocate(conn, [scored(ids["record_id"], index=4.2)], commit=False)
+
+    status, skip_reason = await status_of(conn, ids["record_id"])
+    assert status == "open"
+    assert skip_reason is None
+
+
+async def test_preview_mode_writes_no_score_columns(conn):
+    ids = await scenario(conn)
+
+    await allocate(conn, [scored(ids["record_id"], index=4.2, cate=0.9)], commit=False)
+
+    row = await conn.fetchrow(
+        "SELECT uplift_score, whittle_index FROM at_risk_records WHERE id = $1",
+        ids["record_id"],
+    )
+    assert row["uplift_score"] is None
+    assert row["whittle_index"] is None
+
+
+async def test_commit_mode_still_transitions_and_writes_audit_as_before(conn):
+    """The default is unchanged: the harness and the real cycle keep getting
+    the transition, the score columns, and the audit entry."""
+    ids = await scenario(conn)
+
+    await allocate(conn, [scored(ids["record_id"], index=4.2)])  # commit=True default
+
+    status, _ = await status_of(conn, ids["record_id"])
+    assert status == "scheduled"
+    assert ACTION_SCHEDULE in await audit_actions(conn, ids["record_id"])

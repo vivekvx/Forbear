@@ -36,8 +36,10 @@ truth does not exist, and in production it never existed at all.
 
 from __future__ import annotations
 
+import pickle
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence, Union
 
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
@@ -305,3 +307,24 @@ class UpliftModel:
         self._check_fitted()
         X = np.asarray(X, dtype=float)
         return self._treated_model.predict_proba(X)[:, 1]
+
+    def save_model(self, path: Union[str, Path]) -> None:
+        """Persist a fitted model as a fixed artifact.
+
+        Production loads this once at startup rather than fitting per
+        request: fitting is expensive and, over a single freshly-ingested
+        record, has no batch to fit against anyway.
+        """
+        self._check_fitted()
+        with open(path, "wb") as handle:
+            pickle.dump(self, handle)
+
+    @classmethod
+    def load_model(cls, path: Union[str, Path]) -> "UpliftModel":
+        """Load a model persisted by save_model(). The counterpart to it."""
+        with open(path, "rb") as handle:
+            model = pickle.load(handle)
+        if not isinstance(model, cls):
+            raise TypeError(f"{path} does not contain a fitted {cls.__name__}")
+        model._check_fitted()
+        return model

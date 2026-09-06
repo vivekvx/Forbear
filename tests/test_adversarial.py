@@ -222,9 +222,10 @@ def legal_moment(now: datetime) -> datetime:
 async def attack_revoked_mandate(conn) -> AttackResult:
     """The customer cancelled the mandate. The invoice is still owed."""
     now = await conn.fetchval("SELECT now()")
-    ids = await plant_target(conn, mandate_status="revoked", now=now)
+    legal = legal_moment(now)
+    ids = await plant_target(conn, mandate_status="revoked", now=legal)
 
-    with pinned_clock(legal_moment(now)):
+    with pinned_clock(legal):
         verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
 
     return AttackResult(
@@ -238,9 +239,10 @@ async def attack_revoked_mandate(conn) -> AttackResult:
 async def attack_expired_mandate(conn) -> AttackResult:
     """The authorisation lapsed. Debiting anyway is unauthorised, not late."""
     now = await conn.fetchval("SELECT now()")
-    ids = await plant_target(conn, mandate_status="expired", now=now)
+    legal = legal_moment(now)
+    ids = await plant_target(conn, mandate_status="expired", now=legal)
 
-    with pinned_clock(legal_moment(now)):
+    with pinned_clock(legal):
         verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
 
     return AttackResult(
@@ -254,9 +256,10 @@ async def attack_expired_mandate(conn) -> AttackResult:
 async def attack_attempt_cap_exceeded(conn) -> AttackResult:
     """Every permitted attempt already spent. One more is a cap breach."""
     now = await conn.fetchval("SELECT now()")
-    ids = await plant_target(conn, attempts=MAX_ATTEMPTS, now=now)
+    legal = legal_moment(now)
+    ids = await plant_target(conn, attempts=MAX_ATTEMPTS, now=legal)
 
-    with pinned_clock(legal_moment(now)):
+    with pinned_clock(legal):
         verdict = await guard_check(
             conn, ids["record_id"], charge(ids["record_id"], MAX_ATTEMPTS + 1)
         )
@@ -276,10 +279,10 @@ async def attack_attempt_cap_exceeded(conn) -> AttackResult:
 async def attack_npci_window_violation(conn) -> AttackResult:
     """10:30 IST. A perfectly good record, debited at an hour NPCI forbids."""
     now = await conn.fetchval("SELECT now()")
-    ids = await plant_target(conn, now=now)
     restricted = now.astimezone(IST).replace(
         hour=10, minute=30, second=0, microsecond=0
     )
+    ids = await plant_target(conn, now=restricted)
 
     with pinned_clock(restricted):
         verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
@@ -517,9 +520,16 @@ async def test_the_blocked_record_was_one_the_allocator_wanted(conn):
 
     assert index > 0
 
+    # The notification must be planted relative to the instant the guard will
+    # actually see, not wall-clock now: legal_moment() can sit up to ~12 hours
+    # away from whatever time the test happens to run, and that drift alone
+    # was enough to erode the 1-hour margin between the 25h-old notification
+    # planted here and the 24h regulatory lead RULE_NOTIFICATION enforces,
+    # making this test's outcome depend on the hour of day it ran in.
     now = await conn.fetchval("SELECT now()")
-    ids = await plant_target(conn, now=now)
-    with pinned_clock(legal_moment(now)):
+    legal = legal_moment(now)
+    ids = await plant_target(conn, now=legal)
+    with pinned_clock(legal):
         verdict = await guard_check(conn, ids["record_id"], charge(ids["record_id"]))
 
     assert verdict.allowed, f"a clean record was refused by {verdict.rule_name}"

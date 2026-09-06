@@ -338,6 +338,7 @@ async def _record_skip(
     facts: _RecordFacts,
     reason: str,
     details: dict[str, Any],
+    commit: bool,
 ) -> None:
     """Move a record to skipped and write the reasoning behind it.
 
@@ -345,15 +346,20 @@ async def _record_skip(
     entry, which records that the status changed, and this one, which records
     why. The second is the one a reviewer actually needs - a status change with
     a reason code is a fact, and the numbers underneath it are the argument.
+
+    commit=False (preview mode) computes the identical plan entry but writes
+    neither the transition nor either audit entry - a caller previewing a plan
+    gets the real numbers without the record ever appearing to have moved.
     """
-    await transition(conn, facts.record_id, RecordStatus.SKIPPED, reason=reason)
-    await append_entry(
-        conn,
-        ENTITY_TYPE,
-        facts.record_id,
-        ACTION_SKIP,
-        {"skip_reason": reason, **details},
-    )
+    if commit:
+        await transition(conn, facts.record_id, RecordStatus.SKIPPED, reason=reason)
+        await append_entry(
+            conn,
+            ENTITY_TYPE,
+            facts.record_id,
+            ACTION_SKIP,
+            {"skip_reason": reason, **details},
+        )
     plan.skipped.append(SkippedRecord(facts.record_id, reason, details))
 
 
@@ -364,6 +370,7 @@ async def _record_schedule(
     scored: ScoredRecord,
     slot: datetime,
     reasoning: dict[str, Any],
+    commit: bool,
 ) -> None:
     """Move a record to scheduled and record what was decided and why.
 
@@ -371,33 +378,37 @@ async def _record_schedule(
     against the cap, and creating it now would mean the cap was spent by a plan
     rather than by an action - exactly the accounting error the attempts table
     exists to prevent.
+
+    commit=False (preview mode) skips the transition, the score-column write,
+    and the audit entry - see _record_skip.
     """
-    await transition(conn, facts.record_id, RecordStatus.SCHEDULED)
-    await conn.execute(
-        """
-        UPDATE at_risk_records
-        SET uplift_score = $2, whittle_index = $3
-        WHERE id = $1
-        """,
-        facts.record_id,
-        scored.cate,
-        scored.whittle_index,
-    )
-    await append_entry(
-        conn,
-        ENTITY_TYPE,
-        facts.record_id,
-        ACTION_SCHEDULE,
-        {
-            "action_kind": ActionKind.CHARGE.value,
-            "scheduled_at": slot.isoformat(),
-            "cate": scored.cate,
-            "whittle_index": scored.whittle_index,
-            "amount": facts.amount,
-            "attempts_so_far": facts.attempts_so_far,
-            **reasoning,
-        },
-    )
+    if commit:
+        await transition(conn, facts.record_id, RecordStatus.SCHEDULED)
+        await conn.execute(
+            """
+            UPDATE at_risk_records
+            SET uplift_score = $2, whittle_index = $3
+            WHERE id = $1
+            """,
+            facts.record_id,
+            scored.cate,
+            scored.whittle_index,
+        )
+        await append_entry(
+            conn,
+            ENTITY_TYPE,
+            facts.record_id,
+            ACTION_SCHEDULE,
+            {
+                "action_kind": ActionKind.CHARGE.value,
+                "scheduled_at": slot.isoformat(),
+                "cate": scored.cate,
+                "whittle_index": scored.whittle_index,
+                "amount": facts.amount,
+                "attempts_so_far": facts.attempts_so_far,
+                **reasoning,
+            },
+        )
     plan.scheduled.append(ScheduledAction(facts.record_id, ActionKind.CHARGE, slot))
 
 
@@ -405,6 +416,7 @@ async def allocate(
     conn,
     records_with_scores: list[ScoredRecord],
     config: Optional[AllocationConfig] = None,
+    commit: bool = True,
 ) -> AllocationPlan:
     """Plan one cycle. Must run inside a transaction.
 
@@ -417,6 +429,14 @@ async def allocate(
     revoked mandate is skipped for the mandate, not for its index, because "we
     did not chase this because the index was low" would be a false account of a
     record that could not have been charged at all.
+
+    commit=False computes the identical AllocationPlan - same scoring, same
+    Whittle-ranked ordering, same filters, same skip reasons - but writes no
+    state transition and no audit entry for any record. It exists so a caller
+    can get the real plan for a preview (the merchant worklist) without the
+    real cycle's side effects; the harness and the real cycle always run with
+    commit=True (the default), and the two modes are required to agree on
+    every record's bucket, action and reason - see test_allocator_preview.py.
     """
     if not conn.is_in_transaction():
         raise RuntimeError("allocate must run inside a transaction")
@@ -459,6 +479,7 @@ async def allocate(
                     "whittle_index": scored.whittle_index,
                     "detail": "no classifier mapping; on the exception list",
                 },
+                commit=commit,
             )
             continue
 
@@ -476,6 +497,7 @@ async def allocate(
                     "whittle_index": scored.whittle_index,
                     "detail": "no attempt can recover this failure class",
                 },
+                commit=commit,
             )
             continue
 
@@ -493,6 +515,7 @@ async def allocate(
                     "whittle_index": scored.whittle_index,
                     "detail": "mandate cannot authorise a debit",
                 },
+                commit=commit,
             )
             continue
 
@@ -516,6 +539,7 @@ async def allocate(
                         "value than it recovers"
                     ),
                 },
+                commit=commit,
             )
             continue
 
@@ -535,6 +559,7 @@ async def allocate(
                     "cate": scored.cate,
                     "whittle_index": scored.whittle_index,
                 },
+                commit=commit,
             )
             continue
 
@@ -568,6 +593,7 @@ async def allocate(
                         "ceiling was already spent on higher-index records"
                     ),
                 },
+                commit=commit,
             )
             continue
 
@@ -628,6 +654,7 @@ async def allocate(
                     "ltv_at_risk": ltv_at_risk(facts.plan_amount),
                     "whittle_index": scored.whittle_index,
                 },
+                commit=commit,
             )
             continue
 
@@ -645,6 +672,7 @@ async def allocate(
                     "notification_usable": notification_is_usable,
                 }
             },
+            commit=commit,
         )
         scheduled_amount += facts.amount
 

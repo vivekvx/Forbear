@@ -25,10 +25,11 @@ import logging
 import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from forbear.services import ingestion
+from forbear.services.decisioning import decide_record_in_background
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ def _event_id(request: Request, event: dict, raw_body: bytes) -> str:
 
 
 @router.post("/webhooks/razorpay")
-async def razorpay_webhook(request: Request) -> Any:
+async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks) -> Any:
     raw_body = await request.body()
 
     if not signature_is_valid(raw_body, request.headers.get(SIGNATURE_HEADER)):
@@ -122,7 +123,7 @@ async def razorpay_webhook(request: Request) -> Any:
 
         try:
             async with conn.transaction():
-                await handler(conn, event)
+                record_id = await handler(conn, event)
         except Exception:
             # The event row is already committed, so the payload survives for
             # investigation and manual replay. Only the handler's work rolls
@@ -131,6 +132,15 @@ async def razorpay_webhook(request: Request) -> Any:
                 "handler for %s failed on event %s", event_type, event_id
             )
             return {"status": "error_logged", "event_id": event_id}
+
+    # Scored and allocated after the webhook's own transaction has committed,
+    # never inside it: the worklist read path must stay a plain read, and a
+    # scoring failure here must never turn a successfully ingested webhook
+    # into a 500 that Razorpay retries.
+    if record_id is not None:
+        background_tasks.add_task(
+            decide_record_in_background, request.app.state.pool, record_id
+        )
 
     return {"status": "processed", "event_id": event_id}
 

@@ -105,6 +105,35 @@ pytest                              # full suite
 `run_demo.py` creates and drops its own throwaway database — nothing above
 needs to exist first beyond a running PostgreSQL server.
 
+### Live-pipe demo
+
+Razorpay's test-mode dashboard isn't always available. In its place, a local
+emitter (`forbear/emitter/`) builds webhook payloads in Razorpay's exact
+documented shape, signs them with a real HMAC-SHA256 webhook secret, and POSTs
+them at Forbear's real `/webhooks/razorpay` endpoint — the same signature
+verification, replay detection, classification, and state-transition code a
+real Razorpay delivery would hit. Only the sender is local.
+
+```bash
+export FORBEAR_DSN=postgres:///forbear
+export RAZORPAY_WEBHOOK_SECRET=demo_secret
+psql -f schema.sql forbear   # first run only
+
+uvicorn forbear.api.main:app --reload &
+python scripts/run_live_demo.py
+```
+
+The script truncates the database, emits a batch of mixed lifecycles
+(insufficient-funds-then-recovers, insufficient-funds-then-halts,
+revoked-mandate) at the running server, and reports how many events were
+accepted, deduped, or rejected, and how many `at_risk_records` and audit
+entries came out the other side.
+
+`forbear/emitter/scenarios.py` also has named scenarios for a duplicate
+delivery (replay) and a tampered signature (rejected with 401), and
+`tests/test_emitter.py` round-trips the emitter's signatures against the real
+receiver.
+
 ## Stack
 
 Python 3.11, FastAPI, PostgreSQL, scikit-uplift. No ORM for anything touching
