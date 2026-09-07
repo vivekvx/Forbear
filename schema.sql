@@ -101,7 +101,29 @@ ALTER TABLE at_risk_records
     -- (typically the LTV a contact would put at risk). Precomputed so an
     -- override warning is also a read, not a recomputation.
     ADD COLUMN worklist_cost_paise BIGINT,
-    ADD COLUMN worklist_decided_at TIMESTAMPTZ;
+    ADD COLUMN worklist_decided_at TIMESTAMPTZ,
+    -- The raw allocator skip_reason code behind a leave_alone decision (NULL
+    -- for chase/wait). Decisioning runs allocate() with commit=False, so the
+    -- bare skip_reason column above (which the real commit=True cycle writes)
+    -- stays empty here; this is the preview's own copy of the same code, kept
+    -- so a reader can tell a do-not-disturb skip (negative_net_value - the
+    -- ones a save can come from) apart from a terminal one (nothing could
+    -- have been done regardless of ground truth) without parsing audit JSON.
+    ADD COLUMN worklist_skip_reason TEXT;
+
+
+-- Demo-only answer key: which do_not_disturb-style leave_alone decisions
+-- actually protected a customer, per the synthetic generator's ground truth.
+-- Real production ingestion (the webhook path) never writes this table - a
+-- real webhook has no counterfactual to report - so its emptiness is exactly
+-- how the worklist tells production data apart from a demo run and hides the
+-- protected-customers panel rather than fabricate one.
+CREATE TABLE demo_ground_truth (
+    at_risk_record_id      BIGINT  PRIMARY KEY REFERENCES at_risk_records (id),
+    would_churn_if_contacted  BOOLEAN NOT NULL,
+    would_pay_without_contact BOOLEAN NOT NULL,
+    remaining_ltv_paise       BIGINT  NOT NULL
+);
 
 
 -- Every merchant-triggered action, keyed for idempotency. A double-tap on the

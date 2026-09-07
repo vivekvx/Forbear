@@ -215,6 +215,9 @@ async def decide_record(conn, record_id: int) -> Optional[str]:
     reason: str
     scheduled_at = None
     cost_paise = None
+    # Set only for a real leave_alone (see below); chase and wait never carry
+    # a skip reason, since nothing was skipped to produce them.
+    worklist_skip_reason: Optional[str] = None
 
     if plan.scheduled:
         scheduled = plan.scheduled[0]
@@ -237,6 +240,7 @@ async def decide_record(conn, record_id: int) -> Optional[str]:
             bucket, action = "leave_alone", "none"
             cost_paise = details.get("ltv_at_risk") or details.get("amount")
             reason = _leave_alone_reason(skip.skip_reason, details)
+            worklist_skip_reason = skip.skip_reason
 
     await conn.execute(
         """
@@ -246,7 +250,8 @@ async def decide_record(conn, record_id: int) -> Optional[str]:
             worklist_reason = $4,
             worklist_scheduled_at = $5,
             worklist_cost_paise = $6,
-            worklist_decided_at = $7
+            worklist_decided_at = $7,
+            worklist_skip_reason = $8
         WHERE id = $1
         """,
         record_id,
@@ -256,6 +261,7 @@ async def decide_record(conn, record_id: int) -> Optional[str]:
         scheduled_at,
         cost_paise,
         now,
+        worklist_skip_reason,
     )
     await append_entry(
         conn,

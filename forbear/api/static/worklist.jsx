@@ -114,6 +114,47 @@ function LeaveAloneRow({ row }) {
   );
 }
 
+function ProtectedRow({ row }) {
+  return (
+    <div className="row row-quiet">
+      <div className="row-main">
+        <div className="row-name">{row.customer_name}</div>
+        <div className="row-amount protected-amount">
+          {rupees(row.value_protected_rupees)} protected
+        </div>
+      </div>
+      <div className="row-reason">{row.reason}</div>
+    </div>
+  );
+}
+
+function ProtectedPanel({ protectedData }) {
+  if (!protectedData) return null;
+
+  if (!protectedData.available) {
+    return (
+      <p className="protected-note">
+        Customers saved by leaving them alone: {protectedData.message}
+      </p>
+    );
+  }
+
+  if (protectedData.customers_protected === 0) return null;
+
+  return (
+    <section className="section protected-panel">
+      <div className="protected-header">
+        <p className="protected-sentence">{protectedData.sentence}</p>
+      </div>
+      <div className="section-body">
+        {protectedData.saves.map((row) => (
+          <ProtectedRow key={row.record_id} row={row} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function Section({ title, count, defaultOpen, children }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -130,6 +171,7 @@ function Section({ title, count, defaultOpen, children }) {
 
 function App() {
   const [data, setData] = useState(null);
+  const [protectedData, setProtectedData] = useState(null);
   const [error, setError] = useState(null);
   const [doneToday, setDoneToday] = useState(() => new Set());
 
@@ -140,6 +182,13 @@ function App() {
       setData(await res.json());
     } catch (e) {
       setError(String(e));
+    }
+    try {
+      const res = await fetch("/worklist/protected");
+      if (res.ok) setProtectedData(await res.json());
+    } catch (e) {
+      // The protected panel is a bonus view; its failure should not block
+      // the worklist itself from rendering.
     }
   }, []);
 
@@ -200,6 +249,8 @@ function App() {
           ))
         )}
       </Section>
+
+      <ProtectedPanel protectedData={protectedData} />
     </div>
   );
 }

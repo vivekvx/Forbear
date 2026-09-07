@@ -490,6 +490,14 @@ SIMULATION_MODULES = frozenset(
         # it here rather than letting it pass silently is the point: a route
         # that fabricates customers should be visible in a diff.
         "forbear/api/stream.py",
+        # Seeds a demo book plus its answer key for GET /worklist/protected.
+        # Like the two entries above, it generates the very book it reports
+        # on; it hands decide_record only the record id, never the ground
+        # truth, so the decision path stays clean even though this module
+        # cannot (see test_the_decision_path_is_clean_even_of_sanctioned_
+        # exceptions, which would fail if decide_record's own module were
+        # ever added here instead).
+        "forbear/services/demo_seed.py",
     }
 )
 
