@@ -67,6 +67,27 @@ Nine components, in the order a failed debit passes through them:
    strategies (Forbear, fixed schedule, unconstrained) and reports net value,
    recovery rate, churn rate, and attempts per strategy. Does not feed
    anything back into the allocator; it is read-only measurement.
+10. **Decisioning** (`forbear/services/decisioning.py`) — runs once per
+    ingested record, in the background, right after the webhook that created
+    it commits. The uplift model is fitted once, offline, by
+    `scripts/train_model.py`, and loaded from disk the first time
+    decisioning needs it — not per webhook, not per worklist read. Loads
+    real features, scores with the loaded uplift model,
+    computes the Whittle index, and calls the same `allocator.allocate()` the
+    harness calls, in preview mode (`commit=False`): the real plan comes
+    back — scheduled action or skip reason, with the real numbers — but
+    `allocate()` writes no state transition and no audit entry of its own.
+    Decisioning persists the plan to `worklist_*` columns and writes exactly
+    one audit entry per decision. This is the only place a record's
+    worklist bucket gets decided; the worklist endpoint below never computes
+    one.
+11. **Worklist read** (`forbear/api/worklist.py`) — `GET /worklist` groups
+    already-decided records into chase / wait / leave-alone and computes the
+    fear number; `GET /worklist/protected` names the leave-alone records
+    that, per demo-only ground truth, were saves. Both are SQL and
+    arithmetic only — no model, no allocator, nothing computed at request
+    time. This is what keeps the read under the sub-200ms budget the
+    worklist promises: the work already happened in decisioning.
 
 **The separation invariant:** the allocator plans, the guard permits, and
 they share no code. The guard imports only `forbear.config.limits` and
@@ -77,6 +98,29 @@ customer's bank account is the guard, and the guard re-derives every
 constraint from the database rather than trusting anything it is handed. No
 LLM or model output reaches the execution path — models score, deterministic
 code decides and executes.
+
+**The single-decision-path guarantee.** The merchant worklist and the
+measurement harness call the same function — `allocator.allocate()` — with
+the same scoring, the same Whittle index, and the same skip logic. The only
+difference is `commit`: the harness runs `commit=True` and gets the real
+production cycle, transitions and audit entries included; decisioning runs
+`commit=False` at ingestion and gets the identical plan back with no side
+effects, then persists that plan itself. There is no second, simplified
+scoring path for the merchant view — an earlier build of the worklist did
+have one (a heuristic CATE-to-bucket table, see
+[docs/ENGINEERING_LOG.md](ENGINEERING_LOG.md)), and it was deleted rather
+than kept as a fallback, because a merchant view that can disagree with what
+the harness measures makes the project's central claim untestable. The
+guarantee is not asserted; it is proven by
+`tests/test_allocator.py::test_preview_and_commit_plans_are_identical_for_scheduled_records`
+and `test_preview_and_commit_plans_are_identical_for_skipped_records`, which
+run both modes on identical inputs and assert the returned plans match —
+same bucket, same action, same skip reason, same numbers. Companion tests
+(`test_preview_mode_writes_no_audit_entry`,
+`test_preview_mode_causes_no_state_transition`,
+`test_preview_mode_writes_no_score_columns`) confirm preview mode really
+writes nothing, so the guarantee is about the plan, not about a rollback
+hiding a divergence.
 
 ## 3. Method
 
@@ -349,6 +393,30 @@ infer a customer's likely salary-timing window. Two seeded invoices per
 customer is the current workaround in the harness; a customer with zero
 payment history gets no timing signal and the allocator falls back to the
 population default.
+
+**The protected-customers panel is demo-mode only, and says so.**
+`GET /worklist/protected` needs ground truth — what would have happened if a
+customer had been contacted — which exists only in
+`forbear/services/demo_seed.py`'s synthetic seeding, never in a database
+populated by real webhooks. The endpoint distinguishes the two by whether
+`demo_ground_truth` has any rows at all, not by a mode flag that could drift
+out of sync with reality; against a real deployment it returns
+`available: false` and an explanation, not a fabricated number. Measuring
+real saves in production would require a genuine holdout — a slice of
+do-not-disturb-classified customers contacted anyway, after deployment, so
+the churn-if-contacted counterfactual is observed rather than simulated. That
+holdout does not exist in this codebase.
+
+**Live integration is against a real-format emitter, not a live Razorpay
+account.** Razorpay's test-mode dashboard access was unavailable during this
+build. `forbear/emitter/` produces payloads in Razorpay's documented shape,
+signed with a real HMAC-SHA256 secret, sent at the real
+`/webhooks/razorpay` endpoint — the same signature verification, replay
+detection, and classification code a live delivery would hit — but no
+request in this project has ever gone to Razorpay's servers or a real
+merchant account. Whether Razorpay's actual production payloads match the
+documented shape byte-for-byte, and whether their retry/redelivery behaviour
+matches what the emitter simulates, is unverified.
 
 ## 6. What I would do with production data
 

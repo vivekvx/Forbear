@@ -21,6 +21,38 @@ dropped, not chased on the hope it might work. The objective is net customer
 value: recovering ₹499 from someone who cancels a ₹5,988/year subscription
 over being chased is not a win.
 
+## What it is now
+
+Two surfaces sit on top of the same decision:
+
+- **The merchant worklist** (`GET /worklist`, served at `/`) — chase / wait /
+  leave-alone, one screen a non-technical operator opens every morning. Every
+  bucket is produced by `forbear/services/decisioning.py` calling the real
+  `forbear/services/allocator.py::allocate()` in preview mode
+  (`commit=False`) right after ingestion — same uplift model, same Whittle
+  index, same skip logic the harness measures, not a separate heuristic. The
+  worklist endpoint itself runs no model and no allocator: it is a plain SQL
+  read of decisions already persisted, which is what keeps it under the
+  sub-200ms budget. `GET /worklist/protected` names the customers left alone
+  who, per the simulator's ground truth, would have churned if chased and
+  stayed subscribed because nobody contacted them — the value the system
+  protected, not just recovered. That endpoint only works in demo mode, since
+  it needs outcome data no real production system has; against a live
+  database it reports itself unavailable rather than fabricating a number.
+- **The measurement harness** (`/advanced`, `GET /stream/run`) — the
+  technical decision stream, comparison table, and sensitivity sweep, for the
+  deep-dive.
+
+`allocate()`'s `commit=False`/`commit=True` modes are proven to return the
+same plan for the same inputs by
+`tests/test_allocator.py::test_preview_and_commit_plans_are_identical_for_scheduled_records`
+(and its skipped-record counterpart) — the worklist and the harness are
+provably one decision path, not two that happen to agree today.
+
+The uplift model backing both surfaces is fitted once, offline, by
+`scripts/train_model.py`, and loaded from disk at startup — never refit per
+webhook, never refit per request.
+
 ## Results
 
 Mean ± σ across **10 seeds** at n=500. One seed is one draw of a synthetic
@@ -99,29 +131,37 @@ export FORBEAR_ADMIN_DSN=postgres:///postgres   # or your own DSN
 psql -f schema.sql your_database
 
 python scripts/run_demo.py          # adversarial suite, comparison, sweep, scale check
-pytest                              # full suite
+pytest                              # full suite: 414 passed, 8 skipped
 ```
 
 `run_demo.py` creates and drops its own throwaway database — nothing above
 needs to exist first beyond a running PostgreSQL server.
 
-### Live-pipe demo
+### Live-pipe demo: worklist end to end
 
 Razorpay's test-mode dashboard isn't always available. In its place, a local
 emitter (`forbear/emitter/`) builds webhook payloads in Razorpay's exact
 documented shape, signs them with a real HMAC-SHA256 webhook secret, and POSTs
 them at Forbear's real `/webhooks/razorpay` endpoint — the same signature
 verification, replay detection, classification, and state-transition code a
-real Razorpay delivery would hit. Only the sender is local.
+real Razorpay delivery would hit. Only the sender is local: this is a
+real-format payload through the real ingestion path, not a live Razorpay
+account, because test-mode access to one was unavailable during this build.
 
 ```bash
 export FORBEAR_DSN=postgres:///forbear
 export RAZORPAY_WEBHOOK_SECRET=demo_secret
 psql -f schema.sql forbear   # first run only
 
+python scripts/train_model.py            # fits the uplift model once, writes models/uplift_model.pkl
 uvicorn forbear.api.main:app --reload &
-python scripts/run_live_demo.py
+python scripts/run_live_demo.py          # emits signed webhooks at the running server
 ```
+
+Open `http://localhost:8000/` for the worklist once the demo has run — chase,
+wait, and leave-alone populated from real decisions made at ingestion, not
+computed on page load. The technical decision stream moved to
+`http://localhost:8000/advanced`.
 
 The script truncates the database, emits a batch of mixed lifecycles
 (insufficient-funds-then-recovers, insufficient-funds-then-halts,
@@ -133,6 +173,14 @@ entries came out the other side.
 delivery (replay) and a tampered signature (rejected with 401), and
 `tests/test_emitter.py` round-trips the emitter's signatures against the real
 receiver.
+
+To see the protected-customers panel, seed a demo database with ground truth
+via `forbear/services/demo_seed.py` (see `tests/test_demo_seed.py` for
+usage) — it generates a synthetic batch, runs each record through the real
+decision path, and separately records what would have happened if contacted,
+which is what `GET /worklist/protected` reads. A database populated only by
+real webhooks has no `demo_ground_truth` rows, so that endpoint reports
+itself unavailable rather than a number.
 
 ## Stack
 

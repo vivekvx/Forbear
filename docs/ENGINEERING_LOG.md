@@ -390,3 +390,154 @@ land below zero, and the system skips more than better-calibrated estimates
 would justify. Some of the n=500 profit was noise skipping in a profitable
 direction. Both this assertion and the net-value one are now
 `xfail(strict=True)` with the mechanism in the reason string.
+
+---
+
+### 2026-09-05 — Adversarial test flaked on wall-clock hour
+
+**Symptom.** `test_the_blocked_record_was_one_the_allocator_wanted` passed or
+failed depending on what hour of the day it ran — 20/20 failures when run in
+the afternoon/evening UTC, passing reliably otherwise.
+
+**Assumed.** The test used `pinned_clock` throughout, the same fixture the
+attack functions use, so it should have been time-independent by
+construction.
+
+**Actually wrong.** `legal_moment(now)` — the helper that picks a
+guard-compliant instant near `now` — can land up to roughly 12 hours away
+from the real wall-clock `now` depending on NPCI execution windows and
+notification-lead arithmetic. The test created its target record using
+wall-clock `now`, then evaluated the record's legality under
+`pinned_clock(legal)` — a different instant, sometimes on the other side of a
+day boundary from the record's own creation timestamp. Whether the mismatch
+mattered depended on where in that ~12-hour gap the real clock happened to
+be when the test ran, which is what made it a wall-clock-hour flake rather
+than a deterministic pass or fail.
+
+**Fix.** Pinned record creation to the same `legal` moment used to evaluate
+it, rather than to wall-clock `now`, so record state and the clock the guard
+checks it against are always the same instant. The same latent
+`now`-vs-`legal_moment(now)` mismatch existed in four of the attack
+functions (`attack_revoked_mandate`, `attack_expired_mandate`,
+`attack_attempt_cap_exceeded`, `attack_insufficient_notification_lead`) —
+they hadn't yet been observed to flake, but the same reasoning applied, so
+all four were pinned the same way rather than left as latent bugs waiting
+for the right hour of day to surface.
+
+**Before/after.** Before: 20/20 failures when run in the afternoon/evening
+UTC window, passing outside it — a flake that depended on when CI happened to
+run. After: 20/20 passes across repeated runs, independent of wall-clock
+hour.
+
+---
+
+### 2026-09-06 — The first worklist scored records against a heuristic table, not the allocator
+
+**Symptom / finding, not a runtime bug.** The first implementation of
+`forbear/services/decisioning.py` built each record's chase/wait/leave-alone
+bucket from a documented `failure_class -> CATE` lookup table, reasoning
+about the allocator's behaviour rather than calling it. Nothing was broken —
+the tests for that version passed — but the worklist's decisions and the
+harness's measured decisions were produced by two different code paths that
+happened to agree on the cases tested.
+
+**Why this was wrong even though it passed.** The project's central claim is
+that Forbear's policy is worth running, measured by the harness. If the
+merchant-facing worklist can show a bucket the harness's `allocate()` would
+not have produced for the same record — and a hand-written heuristic table
+has no mechanism guaranteeing it can't — the measured numbers stop being a
+claim about what the merchant actually sees.
+
+**Fix.** Rewrote `decisioning.py` to call the real
+`forbear.services.allocator.allocate()` — same uplift model, same Whittle
+index, same skip logic the harness uses — instead of the table, and deleted
+the table. `grep -r "_HEURISTIC_CATE"` across the repository returns nothing
+but the negative-assertion test that checks it stays gone
+(`tests/test_decisioning.py`).
+
+**Before/after.** Before: worklist buckets from a heuristic table, unverified
+against the allocator's actual behaviour. After: worklist buckets are the
+allocator's own output; see the single-decision-path guarantee in
+[docs/ARCHITECTURE.md §2](ARCHITECTURE.md#2-architecture), proven by the
+preview/commit equivalence tests below.
+
+---
+
+### 2026-09-06 — Getting the real plan without the real side effects: savepoint, then a proper preview mode
+
+**Symptom / design problem, not a runtime bug.** Having decided decisioning
+must call the real `allocate()` (previous entry), a second problem followed
+immediately: `allocate()`'s default behaviour transitions the record's state
+and writes an audit entry, but ingestion must leave a record `open` until the
+real allocation cycle actually runs — an existing invariant
+(`tests/test_emitter.py`'s `..._stays_open_for_forbear`) depended on this.
+
+**First fix, and why it was fragile.** Wrapped the call in a database
+savepoint and always rolled it back: `allocate()` ran for real, its
+transition and audit writes happened, and then the whole thing was undone,
+after which decisioning re-persisted the plan's bucket/action/reason to the
+`worklist_*` columns and its own audit entry, separately. This worked — the
+tests passed — but it meant real side effects were written and discarded on
+every ingested record, and the plan decisioning persisted was reconstructed
+from the rolled-back run's return value rather than being the thing that was
+actually committed anywhere. A future change to what `allocate()` writes
+inside the transaction, made without updating decisioning's separate
+persistence, could silently diverge from what the rollback had computed.
+
+**Actual fix.** Gave `allocate()` an explicit `commit: bool = True`
+parameter. `commit=False` runs the identical scoring, Whittle indexing, and
+skip-reason logic and returns the identical `AllocationPlan`, but skips the
+`state_machine` transition call and the `audit.append_entry` write entirely
+— nothing is written and rolled back; nothing is written at all.
+Decisioning now calls `allocate(conn, records, config, commit=False)`
+directly and persists the returned plan once, with one audit entry per
+decision. The savepoint/rollback code was deleted, not deprecated.
+
+**Verified, not just asserted.** Added
+`test_preview_and_commit_plans_are_identical_for_scheduled_records` and
+`test_preview_and_commit_plans_are_identical_for_skipped_records`, which run
+both modes on identical inputs and assert equal plans; plus
+`test_preview_mode_writes_no_audit_entry`,
+`test_preview_mode_causes_no_state_transition`, and
+`test_preview_mode_writes_no_score_columns`, which assert preview mode
+really writes nothing. `harness.py` keeps calling `allocate()` with
+`commit`'s default (`True`), so its behaviour is unchanged.
+
+**Before/after.** Before: real transitions and audit entries written then
+rolled back on every ingested record, plan re-derived from the rollback's
+return value. After: no side effects written in preview mode at all; one
+computation, one persistence, one audit entry per decision.
+
+---
+
+### 2026-09-06 — The protected panel found zero saves until subscriptions were backdated
+
+**Symptom.** The first `forbear/services/demo_seed.py` run — an 80-record
+synthetic batch seeded with ground truth for the protected-customers panel —
+produced zero saves. `GET /worklist/protected` returned `available: true`
+with an empty list, not the demo-only response, which made it look broken
+rather than merely empty.
+
+**Assumed.** The save-matching query itself was wrong — the three-way
+intersection (`leave_alone`, do-not-disturb skip reason, would-churn,
+would-pay-without-contact) looked like the likeliest place for an off-by-one
+or a reversed boolean.
+
+**Actually wrong.** The query was correct; there was nothing for it to find.
+`demo_seed.py` inserted synthetic subscriptions without backdating
+`subscriptions.created_at`, so every subscription in the seeded batch looked
+brand-new to the allocator regardless of the profile's intended
+`subscription_age_months`. Tenure is one of the features that makes
+do-not-disturb visible to the model (see §5 of the architecture doc on the
+feature set); with every record looking equally new, nothing separated into
+the do-not-disturb / negative-net-value bucket that a `leave_alone` save
+requires.
+
+**Fix.** `demo_seed.py` now backdates each seeded subscription's
+`created_at` from the profile's real `subscription_age_months` before
+insertion, so the record's apparent tenure matches the tenure the ground
+truth was generated against.
+
+**Before/after.** Before: 0 saves in an 80-record seeded batch, panel
+indistinguishable from broken. After: saves appear as expected; see
+`tests/test_demo_seed.py` and `tests/test_protected.py`.
